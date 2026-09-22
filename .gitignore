@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target/
+
+# rustfmt backup files
+**/*.rs.bk
+
+# Debug symbols generated on Windows
+*.pdb
