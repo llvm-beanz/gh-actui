@@ -11,11 +11,14 @@ Rust with an interactive terminal UI powered by [Ratatui](https://ratatui.rs/).
 ## Run locally
 
 ```console
-cargo run
+cargo run -- https://github.com/llvm/offload-test-suite
 ```
 
-Use the up arrow or `+` to increment the sample counter, the down arrow or `-`
-to decrement it, and `q` or Escape to exit.
+The table displays the repository's GitHub Actions workflows and supports
+keyboard selection and scrolling.
+
+See [Getting started](docs/getting-started.md) for setup and authentication,
+and the [User reference](docs/user-reference.md) for arguments and shortcuts.
 
 ## Development
 

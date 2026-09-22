@@ -31,3 +31,4 @@ Project: Rust Cargo workspace (resolver = "2") providing the `gh actui` GitHub C
 - Add new dependencies to `workspace.dependencies` in the root `Cargo.toml` and reference them from crate manifests.
 - `Cargo.lock` is intentionally committed (binary workspace) — do not ignore it.
 - Keep user-facing docs in `docs/`; avoid duplicating the full TUI reference in `README.md`.
+- Revise copilot instructions and documentation as the project evolves to ensure accuracy and relevance.
