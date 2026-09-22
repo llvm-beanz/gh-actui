@@ -15,7 +15,7 @@ cargo run -- https://github.com/llvm/offload-test-suite
 ```
 
 The table displays the repository's GitHub Actions workflows and supports
-keyboard selection and scrolling.
+Vim-style keyboard selection, scrolling, and commands. Enter `:q` to exit.
 
 See [Getting started](docs/getting-started.md) for setup and authentication,
 and the [User reference](docs/user-reference.md) for arguments and shortcuts.

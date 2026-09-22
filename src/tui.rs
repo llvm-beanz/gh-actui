@@ -2,7 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
@@ -17,10 +17,25 @@ use crate::{github::Workflow, repository::Repository};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+#[derive(Debug, Default, Eq, PartialEq)]
+enum Mode {
+    #[default]
+    Normal,
+    Command,
+}
+
 struct App {
     repository: Repository,
     workflows: Vec<Workflow>,
     table_state: TableState,
+    mode: Mode,
+    command: String,
+    command_cursor: usize,
+    command_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
+    message: Option<String>,
+    pending_g: bool,
     should_quit: bool,
 }
 
@@ -31,6 +46,14 @@ impl App {
             repository,
             workflows,
             table_state: TableState::default().with_selected(selected),
+            mode: Mode::Normal,
+            command: String::new(),
+            command_cursor: 0,
+            command_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            message: None,
+            pending_g: false,
             should_quit: false,
         }
     }
@@ -51,16 +74,153 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        match self.mode {
+            Mode::Normal => self.handle_normal_key(key),
+            Mode::Command => self.handle_command_key(key),
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.select_next(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(1),
             KeyCode::PageDown => self.select_next(10),
             KeyCode::PageUp => self.select_previous(10),
+            KeyCode::Char('d') if control => self.select_next(10),
+            KeyCode::Char('u') if control => self.select_previous(10),
             KeyCode::Home => self.select_first(),
-            KeyCode::End => self.select_last(),
+            KeyCode::End | KeyCode::Char('G') => self.select_last(),
+            KeyCode::Char('g') if self.pending_g => self.select_first(),
+            KeyCode::Char('g') => {
+                self.pending_g = true;
+                return;
+            }
+            KeyCode::Char(':') => {
+                self.mode = Mode::Command;
+                self.command.clear();
+                self.command_cursor = 0;
+                self.history_index = None;
+                self.history_draft.clear();
+                self.message = None;
+            }
             _ => {}
         }
+
+        self.pending_g = false;
+    }
+
+    fn handle_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.command.clear();
+                self.command_cursor = 0;
+                self.history_index = None;
+                self.history_draft.clear();
+            }
+            KeyCode::Enter => self.execute_command(),
+            KeyCode::Left => {
+                self.command_cursor = self.command_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.command_cursor = (self.command_cursor + 1).min(self.command.chars().count());
+            }
+            KeyCode::Home => self.command_cursor = 0,
+            KeyCode::End => self.command_cursor = self.command.chars().count(),
+            KeyCode::Up => self.previous_command(),
+            KeyCode::Down => self.next_command(),
+            KeyCode::Backspace => self.backspace_command(),
+            KeyCode::Delete => self.delete_command_character(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let byte_index = char_to_byte_index(&self.command, self.command_cursor);
+                self.command.insert(byte_index, character);
+                self.command_cursor += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_command(&mut self) {
+        let command = self.command.trim().to_owned();
+        if !command.is_empty() {
+            self.command_history.push(command.clone());
+        }
+
+        if command == "q" {
+            self.should_quit = true;
+            return;
+        }
+
+        if !command.is_empty() {
+            self.message = Some(format!("E492: Not an editor command: {command}"));
+        }
+        self.command.clear();
+        self.command_cursor = 0;
+        self.history_index = None;
+        self.history_draft.clear();
+        self.mode = Mode::Normal;
+    }
+
+    fn backspace_command(&mut self) {
+        if self.command_cursor == 0 {
+            return;
+        }
+
+        let start = char_to_byte_index(&self.command, self.command_cursor - 1);
+        let end = char_to_byte_index(&self.command, self.command_cursor);
+        self.command.replace_range(start..end, "");
+        self.command_cursor -= 1;
+    }
+
+    fn delete_command_character(&mut self) {
+        if self.command_cursor == self.command.chars().count() {
+            return;
+        }
+
+        let start = char_to_byte_index(&self.command, self.command_cursor);
+        let end = char_to_byte_index(&self.command, self.command_cursor + 1);
+        self.command.replace_range(start..end, "");
+    }
+
+    fn previous_command(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft.clone_from(&self.command);
+                self.command_history.len() - 1
+            }
+        };
+        self.load_history(index);
+    }
+
+    fn next_command(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+
+        if index + 1 < self.command_history.len() {
+            self.load_history(index + 1);
+        } else {
+            self.command.clone_from(&self.history_draft);
+            self.command_cursor = self.command.chars().count();
+            self.history_index = None;
+        }
+    }
+
+    fn load_history(&mut self, index: usize) {
+        self.command.clone_from(&self.command_history[index]);
+        self.command_cursor = self.command.chars().count();
+        self.history_index = Some(index);
     }
 
     fn select_next(&mut self, amount: usize) {
@@ -148,14 +308,38 @@ impl App {
             frame.render_stateful_widget(table, table_area, &mut self.table_state);
         }
 
-        let help = Paragraph::new(
-            "Up/k Down/j: select  |  PgUp/PgDn: scroll  |  Home/End: jump  |  q/Esc: quit",
-        )
-        .dark_gray()
-        .centered()
-        .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(help, help_area);
+        match self.mode {
+            Mode::Normal => {
+                let text = self
+                    .message
+                    .as_deref()
+                    .unwrap_or("j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  gg/G: jump  |  :q: quit");
+                let help = Paragraph::new(text)
+                    .dark_gray()
+                    .block(Block::default().borders(Borders::ALL).title(" NORMAL "));
+                frame.render_widget(help, help_area);
+            }
+            Mode::Command => {
+                let command = Paragraph::new(format!(":{}", self.command))
+                    .block(Block::default().borders(Borders::ALL).title(" COMMAND "));
+                frame.render_widget(command, help_area);
+
+                let cursor_x = help_area
+                    .x
+                    .saturating_add(2)
+                    .saturating_add(self.command_cursor as u16)
+                    .min(help_area.right().saturating_sub(2));
+                frame.set_cursor_position((cursor_x, help_area.y.saturating_add(1)));
+            }
+        }
     }
+}
+
+fn char_to_byte_index(value: &str, character_index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(character_index)
+        .map_or(value.len(), |(index, _)| index)
 }
 
 pub fn run(repository: Repository, workflows: Vec<Workflow>) -> io::Result<()> {
@@ -182,7 +366,6 @@ fn restore_terminal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
 
     fn workflow(id: u64) -> Workflow {
         Workflow {
@@ -200,6 +383,17 @@ mod tests {
         )
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn enter_command(app: &mut App, command: &str) {
+        app.handle_key(key(KeyCode::Char(':')));
+        for character in command.chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+    }
+
     #[test]
     fn new_selects_first_workflow() {
         assert_eq!(app(2).table_state.selected(), Some(0));
@@ -212,24 +406,129 @@ mod tests {
 
     #[test]
     fn handle_key_moves_selection_and_clamps_to_bounds() {
-        let mut app = app(3);
+        let mut app = app(20);
 
-        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(app.table_state.selected(), Some(2));
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.table_state.selected(), Some(19));
 
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.table_state.selected(), Some(2));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.table_state.selected(), Some(19));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.table_state.selected(), Some(9));
 
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.table_state.selected(), Some(0));
     }
 
     #[test]
-    fn handle_key_quits_on_escape() {
+    fn handle_key_supports_gg_to_select_first_workflow() {
+        let mut app = app(3);
+        app.select_last();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn handle_key_does_not_quit_from_normal_mode() {
         let mut app = app(1);
 
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn handle_key_quits_after_q_command() {
+        let mut app = app(1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn escape_cancels_command_mode() {
+        let mut app = app(1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.command.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn unknown_command_displays_error_and_returns_to_normal_mode() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "x");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("E492: Not an editor command: x")
+        );
+    }
+
+    #[test]
+    fn command_cursor_supports_movement_and_mid_line_editing() {
+        let mut app = app(1);
+        enter_command(&mut app, "ac");
+
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.command, "abc");
+        assert_eq!(app.command_cursor, 2);
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.command, "ac");
+        assert_eq!(app.command_cursor, 1);
+
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.command, "a");
+        assert_eq!(app.command_cursor, 1);
+    }
+
+    #[test]
+    fn command_history_scrolls_and_restores_draft() {
+        let mut app = app(1);
+        for command in ["first", "second"] {
+            enter_command(&mut app, command);
+            app.handle_key(key(KeyCode::Enter));
+        }
+        enter_command(&mut app, "draft");
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.command, "second");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.command, "first");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.command, "first");
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.command, "second");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.command, "draft");
+        assert_eq!(app.history_index, None);
+        assert_eq!(app.command_cursor, 5);
+    }
+
+    #[test]
+    fn command_history_ignores_empty_commands() {
+        let mut app = app(1);
+        enter_command(&mut app, "");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.command_history.is_empty());
     }
 }
