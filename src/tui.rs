@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     io,
     path::PathBuf,
     sync::{
@@ -91,6 +91,10 @@ impl Tab {
             is_triage: false,
         }
     }
+
+    fn from_view(tab: ViewTab) -> Self {
+        Self::new(tab.name, tab.workflow_ids, tab.filter, tab.sort)
+    }
 }
 
 struct App {
@@ -141,7 +145,7 @@ impl App {
             |(tabs, active_tab)| {
                 let tabs = tabs
                     .into_iter()
-                    .map(|tab| Tab::new(tab.name, tab.workflow_ids, tab.filter, tab.sort))
+                    .map(Tab::from_view)
                     .collect::<Vec<_>>();
                 let active_tab = active_tab.min(tabs.len().saturating_sub(1));
                 (tabs, active_tab)
@@ -313,11 +317,11 @@ impl App {
                         |tabs| {
                             tabs.into_iter()
                                 .map(|tab| {
-                                    let mut runtime =
-                                        Tab::new(tab.name, tab.workflow_ids, tab.filter, tab.sort);
+                                    let selected_workflow_id = tab.selected_workflow_id;
+                                    let mut runtime = Tab::from_view(tab);
                                     runtime
                                         .table_state
-                                        .select(tab.selected_workflow_id.and_then(|id| {
+                                        .select(selected_workflow_id.and_then(|id| {
                                             self.visible_workflows_for(&runtime)
                                                 .iter()
                                                 .position(|workflow| workflow.id == id)
@@ -670,26 +674,12 @@ impl App {
             }
         };
 
-        let tabs = self
-            .tabs
-            .iter()
-            .map(|tab| ViewTab {
-                name: tab.name.clone(),
-                workflow_ids: tab.workflow_ids.clone(),
-                filter: tab.filter.clone(),
-                sort: tab.sort.clone(),
-                selected_workflow_id: tab
-                    .table_state
-                    .selected()
-                    .and_then(|index| self.visible_workflows_for(tab).get(index).copied())
-                    .map(|workflow| workflow.id),
-            })
-            .collect();
+        let (tabs, active_tab) = self.persisted_tabs();
         let state = ViewState::new(
             self.repository.clone(),
             &self.workflows,
             tabs,
-            self.active_tab,
+            active_tab,
         );
         match state.save(&path) {
             Ok(()) => {
@@ -706,6 +696,58 @@ impl App {
                 false
             }
         }
+    }
+
+    fn persisted_tabs(&self) -> (Vec<ViewTab>, usize) {
+        let normal_tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| !tab.is_triage)
+            .map(|(index, tab)| {
+                (
+                    index,
+                    ViewTab {
+                        name: tab.name.clone(),
+                        workflow_ids: tab.workflow_ids.clone(),
+                        filter: tab.filter.clone(),
+                        sort: tab.sort.clone(),
+                        selected_workflow_id: tab
+                            .table_state
+                            .selected()
+                            .and_then(|selected| {
+                                self.visible_workflows_for(tab).get(selected).copied()
+                            })
+                            .map(|workflow| workflow.id),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if normal_tabs.is_empty() {
+            return (
+                vec![ViewTab {
+                    name: None,
+                    workflow_ids: self
+                        .workflows
+                        .iter()
+                        .map(|workflow| workflow.id)
+                        .collect(),
+                    filter: None,
+                    sort: None,
+                    selected_workflow_id: self.workflows.first().map(|workflow| workflow.id),
+                }],
+                0,
+            );
+        }
+
+        let active_tab = normal_tabs
+            .iter()
+            .rposition(|(index, _)| *index <= self.active_tab)
+            .unwrap_or(0);
+        (
+            normal_tabs.into_iter().map(|(_, tab)| tab).collect(),
+            active_tab,
+        )
     }
 
     fn edit_state(&mut self, argument: Option<&str>) {
@@ -1109,6 +1151,19 @@ impl App {
     fn render_triage_blocks(&self, frame: &mut Frame, area: Rect, visible_workflows: &[Workflow]) {
         let selected = self.active_tab().table_state.selected().unwrap_or(0);
         let mut y = area.y;
+        let summary = triage_correlation_summary(visible_workflows, &self.triage);
+        let summary_height = triage_block_height(&summary, area.width)
+            .min(area.height)
+            .max(1);
+        let summary_area = Rect::new(area.x, y, area.width, summary_height);
+        let summary_panel = Paragraph::new(summary).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Tests across multiple workflows "),
+        );
+        frame.render_widget(summary_panel, summary_area);
+        y = y.saturating_add(summary_height);
+
         for (index, workflow) in visible_workflows.iter().enumerate().skip(selected) {
             if y >= area.bottom() {
                 break;
@@ -1137,6 +1192,97 @@ impl App {
             y = y.saturating_add(height);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum TestOutcome {
+    Failed,
+    UnexpectedlyPassed,
+}
+
+fn triage_correlation_summary<'a>(
+    workflows: &'a [Workflow],
+    triage: &'a HashMap<u64, WorkflowTriage>,
+) -> Text<'a> {
+    let names = workflows
+        .iter()
+        .map(|workflow| (workflow.id, workflow.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut failed = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut unexpectedly_passed = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for result in triage.values() {
+        let Some(workflow_name) = names.get(&result.workflow_id).copied() else {
+            continue;
+        };
+        for (outcome, test_name) in lit_test_names(&result.lit_summary) {
+            let target = match outcome {
+                TestOutcome::Failed => &mut failed,
+                TestOutcome::UnexpectedlyPassed => &mut unexpectedly_passed,
+            };
+            target.entry(test_name).or_default().insert(workflow_name);
+        }
+    }
+
+    let failed = failed
+        .into_iter()
+        .filter(|(_, workflows)| workflows.len() > 1)
+        .collect::<Vec<_>>();
+    let unexpectedly_passed = unexpectedly_passed
+        .into_iter()
+        .filter(|(_, workflows)| workflows.len() > 1)
+        .collect::<Vec<_>>();
+    if failed.is_empty() && unexpectedly_passed.is_empty() {
+        return Text::from("No tests failed or unexpectedly passed in multiple workflows.");
+    }
+
+    let mut lines = Vec::new();
+    append_correlated_tests(&mut lines, "Failed in multiple workflows:", &failed);
+    if !failed.is_empty() && !unexpectedly_passed.is_empty() {
+        lines.push(Line::default());
+    }
+    append_correlated_tests(
+        &mut lines,
+        "Unexpectedly passed in multiple workflows:",
+        &unexpectedly_passed,
+    );
+    Text::from(lines)
+}
+
+fn append_correlated_tests<'a>(
+    lines: &mut Vec<Line<'a>>,
+    heading: &'a str,
+    tests: &[(&'a str, BTreeSet<&'a str>)],
+) {
+    if tests.is_empty() {
+        return;
+    }
+    lines.push(Line::from(heading).bold());
+    for (test, workflows) in tests {
+        lines.push(Line::from(format!("  {test}")));
+        lines.extend(
+            workflows
+                .iter()
+                .map(|workflow| Line::from(format!("    - {workflow}"))),
+        );
+    }
+}
+
+fn lit_test_names(summary: &str) -> Vec<(TestOutcome, &str)> {
+    let mut outcome = None;
+    let mut tests = Vec::new();
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Failed Tests (") {
+            outcome = Some(TestOutcome::Failed);
+        } else if trimmed.starts_with("Unexpectedly Passed Tests (") {
+            outcome = Some(TestOutcome::UnexpectedlyPassed);
+        } else if trimmed.is_empty() || trimmed.starts_with("**") {
+            outcome = None;
+        } else if let (Some(outcome), Some((_, test))) = (outcome, trimmed.split_once("::")) {
+            tests.push((outcome, test.trim()));
+        }
+    }
+    tests
 }
 
 fn triage_text(triage: Option<&WorkflowTriage>) -> Text<'_> {
@@ -1429,6 +1575,32 @@ mod tests {
         let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
         assert_eq!(ids, vec![3, 1]);
         assert_eq!(app.state_path, Some(PathBuf::from("saved-view.json")));
+    }
+
+    #[test]
+    fn loading_saved_triage_tab_restores_block_view_kind() {
+        let mut app = App::new_loading(
+            "owner/repository".parse().unwrap(),
+            Some(vec![3, 1]),
+            Some(PathBuf::from("saved-view.json")),
+            Arc::new(TestWorkflowSource),
+            Some(vec![ViewTab {
+                name: Some("Triage".to_owned()),
+                is_triage: true,
+                workflow_ids: vec![3, 1],
+                filter: None,
+                sort: None,
+                selected_workflow_id: Some(1),
+            }]),
+            0,
+        );
+
+        complete_loading(&mut app);
+
+        assert!(app.active_tab().is_triage);
+        assert_eq!(app.active_tab().name.as_deref(), Some("Triage"));
+        assert_eq!(app.active_tab().workflow_ids, vec![3, 1]);
+        assert_eq!(app.active_tab().table_state.selected(), Some(1));
     }
 
     #[test]
@@ -2058,6 +2230,79 @@ mod tests {
             ]
         );
         assert_eq!(triage_block_height(&text, 80), 9);
+    }
+
+    #[test]
+    fn triage_summary_correlates_tests_across_workflows() {
+        let workflows = vec![workflow(1), workflow(2), workflow(3)];
+        let mut triage = HashMap::new();
+        triage.insert(
+            1,
+            WorkflowTriage {
+                workflow_id: 1,
+                failed_jobs: String::new(),
+                failed_steps: String::new(),
+                lit_summary: "\
+Failed Tests (2):
+  Suite :: common-failure.test
+  Suite :: unique.test
+Unexpectedly Passed Tests (1):
+  Suite :: common-pass.test"
+                    .to_owned(),
+            },
+        );
+        triage.insert(
+            2,
+            WorkflowTriage {
+                workflow_id: 2,
+                failed_jobs: String::new(),
+                failed_steps: String::new(),
+                lit_summary: "\
+Failed Tests (1):
+  Suite :: common-failure.test
+Unexpectedly Passed Tests (1):
+  Suite :: common-pass.test"
+                    .to_owned(),
+            },
+        );
+        triage.insert(
+            3,
+            WorkflowTriage {
+                workflow_id: 3,
+                failed_jobs: String::new(),
+                failed_steps: String::new(),
+                lit_summary: "Failed Tests (1):\n  Suite :: another-unique.test".to_owned(),
+            },
+        );
+
+        let summary = triage_correlation_summary(&workflows, &triage).to_string();
+
+        assert!(summary.contains("Failed in multiple workflows:"));
+        assert!(summary.contains("common-failure.test"));
+        assert!(summary.contains("Workflow 1"));
+        assert!(summary.contains("Workflow 2"));
+        assert!(summary.contains("Unexpectedly passed in multiple workflows:"));
+        assert!(summary.contains("common-pass.test"));
+        assert!(!summary.contains("unique.test"));
+    }
+
+    #[test]
+    fn triage_summary_reports_when_no_tests_are_shared() {
+        let workflows = vec![workflow(1)];
+        let triage = HashMap::from([(
+            1,
+            WorkflowTriage {
+                workflow_id: 1,
+                failed_jobs: String::new(),
+                failed_steps: String::new(),
+                lit_summary: "Failed Tests (1):\n  Suite :: unique.test".to_owned(),
+            },
+        )]);
+
+        assert_eq!(
+            triage_correlation_summary(&workflows, &triage).to_string(),
+            "No tests failed or unexpectedly passed in multiple workflows."
+        );
     }
 
     #[test]

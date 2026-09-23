@@ -134,19 +134,25 @@ newest scheduled run is still queued or in progress, the most recent completed
 scheduled failure is analyzed instead.
 
 The resulting `Triage` tab displays a vertically scrollable collection of
-bordered workflow panels. Each panel contains the failed jobs, first failed
-step for each job, and the extracted lit summary for failures in the
-`Run HLSL Tests` step. Lit summaries retain their original line structure and
-wrap to the terminal width. Use the normal `j`/`k`, arrow, paging, and jump
-bindings to move between workflow panels; the selected panel has a highlighted
-border. Workflows whose latest scheduled result is not a failure are omitted.
-Run, job, and log requests execute in the background and the footer displays
+bordered panels. The first panel correlates tests reported by more than one
+workflow, with separate sections for failures and unexpected passes and a list
+of the affected workflows under each test. If nothing is shared, it states
+that explicitly.
+
+Each following workflow panel contains the failed jobs, first failed step for
+each job, and the extracted lit summary for failures in the `Run HLSL Tests`
+step. Lit summaries retain their original line structure and wrap to the
+terminal width. Use the normal `j`/`k`, arrow, paging, and jump bindings to
+move between workflow panels; the selected panel has a highlighted border.
+Workflows whose latest scheduled result is not a failure are omitted. Run,
+job, and log requests execute in the background and the footer displays
 `TRIAGING` while they are in progress.
 
-The triage tab's name and workflow subset are saved like any other tab.
-Fetched job, step, and log details are intentionally not saved because they
-may become stale; after loading a session, run `:triage` again to obtain fresh
-details.
+The triage tab's view type, name, workflow subset, and selection are saved, so
+it reloads using the bordered triage layout rather than the normal workflow
+table. Fetched job, step, and log details are intentionally not saved because
+they may become stale; a reloaded triage view shows unavailable details until
+`:triage` is run again to create a fresh analysis tab.
 
 ### Filtering and sorting
 
