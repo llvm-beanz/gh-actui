@@ -85,7 +85,7 @@ The tab shortcuts work in both Normal and Command modes.
 | `:w [path]` | Save the repository and displayed workflows as JSON |
 | `:wq [path]` | Save the view, then exit if the write succeeds |
 | `:e [path]` | Load a saved view and refresh its workflows from GitHub |
-| `:refresh` | Refresh workflow and run data immediately |
+| `:refresh` | Refresh workflow/run data, or rerun the active triage view |
 | `:refresh-rate N` | Refresh automatically every `N` seconds |
 | `:filter EXPRESSION` | Apply a GitHub Projects-style workflow filter |
 | `:filter` | Clear the active filter |
@@ -148,11 +148,18 @@ Workflows whose latest scheduled result is not a failure are omitted. Run,
 job, and log requests execute in the background and the footer displays
 `TRIAGING` while they are in progress.
 
-The triage tab's view type, name, workflow subset, and selection are saved, so
-it reloads using the bordered triage layout rather than the normal workflow
-table. Fetched job, step, and log details are intentionally not saved because
-they may become stale; a reloaded triage view shows unavailable details until
-`:triage` is run again to create a fresh analysis tab.
+Triage tabs and their fetched details are intentionally not saved because the
+analysis may become stale. Saving persists only normal workflow tabs and
+remaps the saved active tab to the nearest preceding normal tab. If only
+triage tabs remain open, the saved session contains one normal tab with the
+complete global monitored workflow list. Run `:triage` after loading to create
+a fresh analysis tab.
+
+Running `:refresh` while a triage tab is active reruns the analysis for that
+tab's workflow subset and replaces its results in place. It does not create
+another tab. Automatic interval refreshes continue to update the shared
+workflow and run data only; they do not repeatedly download triage jobs and
+logs.
 
 ### Filtering and sorting
 

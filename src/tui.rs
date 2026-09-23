@@ -57,6 +57,12 @@ enum LoadKind {
     Refresh,
 }
 
+#[derive(Clone, Copy)]
+enum TriageTarget {
+    NewTab { insert_after: usize },
+    RefreshTab { index: usize },
+}
+
 #[derive(Clone)]
 struct Tab {
     name: Option<String>,
@@ -105,6 +111,7 @@ struct App {
     load_receiver: Option<Receiver<Result<Vec<Workflow>, crate::github::Error>>>,
     pending_load: Option<PendingLoad>,
     triage_receiver: Option<Receiver<Result<Vec<WorkflowTriage>, crate::github::Error>>>,
+    triage_target: Option<TriageTarget>,
     triage: HashMap<u64, WorkflowTriage>,
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -143,10 +150,7 @@ impl App {
                 )
             },
             |(tabs, active_tab)| {
-                let tabs = tabs
-                    .into_iter()
-                    .map(Tab::from_view)
-                    .collect::<Vec<_>>();
+                let tabs = tabs.into_iter().map(Tab::from_view).collect::<Vec<_>>();
                 let active_tab = active_tab.min(tabs.len().saturating_sub(1));
                 (tabs, active_tab)
             },
@@ -159,6 +163,7 @@ impl App {
             load_receiver: None,
             pending_load: None,
             triage_receiver: None,
+            triage_target: None,
             triage: HashMap::new(),
             tabs,
             active_tab,
@@ -254,35 +259,74 @@ impl App {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.triage_receiver = None;
+                self.triage_target = None;
                 self.message = Some("E484: workflow triage stopped unexpectedly".to_owned());
                 return;
             }
         };
         self.triage_receiver = None;
-        self.finish_triage(result.map_err(|error| error.to_string()));
+        let target = self.triage_target.take();
+        self.finish_triage(result.map_err(|error| error.to_string()), target);
     }
 
-    fn finish_triage(&mut self, result: Result<Vec<WorkflowTriage>, String>) {
+    fn finish_triage(
+        &mut self,
+        result: Result<Vec<WorkflowTriage>, String>,
+        target: Option<TriageTarget>,
+    ) {
         match result {
             Ok(results) => {
                 let workflow_ids = results
                     .iter()
                     .map(|result| result.workflow_id)
                     .collect::<Vec<_>>();
+                let result_count = workflow_ids.len();
                 self.triage.extend(
                     results
                         .into_iter()
                         .map(|result| (result.workflow_id, result)),
                 );
-                let mut tab = Tab::new(Some("Triage".to_owned()), workflow_ids, None, None);
-                tab.is_triage = true;
-                tab.table_state
-                    .select((!tab.workflow_ids.is_empty()).then_some(0));
-                self.tabs.insert(self.active_tab + 1, tab);
-                self.active_tab += 1;
+                match target {
+                    Some(TriageTarget::RefreshTab { index })
+                        if self.tabs.get(index).is_some_and(|tab| tab.is_triage) =>
+                    {
+                        let selected_id = self.tabs[index]
+                            .table_state
+                            .selected()
+                            .and_then(|selected| {
+                                self.visible_workflows_for(&self.tabs[index])
+                                    .get(selected)
+                                    .copied()
+                            })
+                            .map(|workflow| workflow.id);
+                        self.tabs[index].workflow_ids = workflow_ids;
+                        let selected = selected_id
+                            .and_then(|id| {
+                                self.visible_workflows_for(&self.tabs[index])
+                                    .iter()
+                                    .position(|workflow| workflow.id == id)
+                            })
+                            .or_else(|| (!self.tabs[index].workflow_ids.is_empty()).then_some(0));
+                        self.tabs[index].table_state.select(selected);
+                    }
+                    Some(TriageTarget::NewTab { insert_after }) => {
+                        let mut tab = Tab::new(Some("Triage".to_owned()), workflow_ids, None, None);
+                        tab.is_triage = true;
+                        tab.table_state
+                            .select((!tab.workflow_ids.is_empty()).then_some(0));
+                        let index = (insert_after + 1).min(self.tabs.len());
+                        self.tabs.insert(index, tab);
+                        self.active_tab = index;
+                    }
+                    _ => {
+                        self.message =
+                            Some("E484: triage destination is no longer available".to_owned());
+                        return;
+                    }
+                }
                 self.message = Some(format!(
                     "{} failing scheduled workflows triaged",
-                    self.active_tab().workflow_ids.len()
+                    result_count
                 ));
             }
             Err(error) => self.message = Some(format!("E484: {error}")),
@@ -319,13 +363,13 @@ impl App {
                                 .map(|tab| {
                                     let selected_workflow_id = tab.selected_workflow_id;
                                     let mut runtime = Tab::from_view(tab);
-                                    runtime
-                                        .table_state
-                                        .select(selected_workflow_id.and_then(|id| {
+                                    runtime.table_state.select(selected_workflow_id.and_then(
+                                        |id| {
                                             self.visible_workflows_for(&runtime)
                                                 .iter()
                                                 .position(|workflow| workflow.id == id)
-                                        }));
+                                        },
+                                    ));
                                     runtime
                                 })
                                 .collect()
@@ -417,11 +461,19 @@ impl App {
             && self.triage_receiver.is_none()
             && Instant::now() >= self.next_refresh
         {
-            self.refresh();
+            self.refresh_workflows();
         }
     }
 
     fn refresh(&mut self) {
+        if self.active_tab().is_triage {
+            self.refresh_triage();
+        } else {
+            self.refresh_workflows();
+        }
+    }
+
+    fn refresh_workflows(&mut self) {
         if self.is_loading() || self.triage_receiver.is_some() {
             self.message = Some("Triage or refresh already in progress".to_owned());
             return;
@@ -675,12 +727,7 @@ impl App {
         };
 
         let (tabs, active_tab) = self.persisted_tabs();
-        let state = ViewState::new(
-            self.repository.clone(),
-            &self.workflows,
-            tabs,
-            active_tab,
-        );
+        let state = ViewState::new(self.repository.clone(), &self.workflows, tabs, active_tab);
         match state.save(&path) {
             Ok(()) => {
                 self.message = Some(format!(
@@ -727,11 +774,7 @@ impl App {
             return (
                 vec![ViewTab {
                     name: None,
-                    workflow_ids: self
-                        .workflows
-                        .iter()
-                        .map(|workflow| workflow.id)
-                        .collect(),
+                    workflow_ids: self.workflows.iter().map(|workflow| workflow.id).collect(),
                     filter: None,
                     sort: None,
                     selected_workflow_id: self.workflows.first().map(|workflow| workflow.id),
@@ -868,6 +911,35 @@ impl App {
             let _ = sender.send(source.triage_workflows(&repository, &workflows));
         });
         self.triage_receiver = Some(receiver);
+        self.triage_target = Some(TriageTarget::NewTab {
+            insert_after: self.active_tab,
+        });
+        self.message = None;
+    }
+
+    fn refresh_triage(&mut self) {
+        if self.is_loading() || self.triage_receiver.is_some() {
+            self.message = Some("Triage or refresh already in progress".to_owned());
+            return;
+        }
+        let workflows = self
+            .visible_workflows()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if workflows.is_empty() {
+            self.message = Some("No workflows in the triage view".to_owned());
+            return;
+        }
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let target = self.active_tab;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.triage_workflows(&repository, &workflows));
+        });
+        self.triage_receiver = Some(receiver);
+        self.triage_target = Some(TriageTarget::RefreshTab { index: target });
         self.message = None;
     }
 
@@ -1517,7 +1589,8 @@ mod tests {
             .unwrap()
             .map_err(|error| error.to_string());
         app.triage_receiver = None;
-        app.finish_triage(result);
+        let target = app.triage_target.take();
+        app.finish_triage(result, target);
     }
 
     #[test]
@@ -1578,29 +1651,34 @@ mod tests {
     }
 
     #[test]
-    fn loading_saved_triage_tab_restores_block_view_kind() {
-        let mut app = App::new_loading(
-            "owner/repository".parse().unwrap(),
-            Some(vec![3, 1]),
-            Some(PathBuf::from("saved-view.json")),
-            Arc::new(TestWorkflowSource),
-            Some(vec![ViewTab {
-                name: Some("Triage".to_owned()),
-                is_triage: true,
-                workflow_ids: vec![3, 1],
-                filter: None,
-                sort: None,
-                selected_workflow_id: Some(1),
-            }]),
-            0,
-        );
+    fn persisted_tabs_exclude_triage_views_and_remap_active_tab() {
+        let mut app = app(3);
+        let mut triage = app.active_tab().clone();
+        triage.name = Some("Triage".to_owned());
+        triage.is_triage = true;
+        app.tabs.push(triage);
+        app.active_tab = 1;
 
-        complete_loading(&mut app);
+        let (tabs, active_tab) = app.persisted_tabs();
 
-        assert!(app.active_tab().is_triage);
-        assert_eq!(app.active_tab().name.as_deref(), Some("Triage"));
-        assert_eq!(app.active_tab().workflow_ids, vec![3, 1]);
-        assert_eq!(app.active_tab().table_state.selected(), Some(1));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].name, None);
+        assert_eq!(tabs[0].workflow_ids, vec![0, 1, 2]);
+        assert_eq!(active_tab, 0);
+    }
+
+    #[test]
+    fn persisted_tabs_fall_back_to_global_workflows_when_only_triage_remains() {
+        let mut app = app(3);
+        app.tabs[0].is_triage = true;
+        app.tabs[0].workflow_ids = vec![2];
+
+        let (tabs, active_tab) = app.persisted_tabs();
+
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].workflow_ids, vec![0, 1, 2]);
+        assert_eq!(tabs[0].selected_workflow_id, Some(0));
+        assert_eq!(active_tab, 0);
     }
 
     #[test]
@@ -2185,6 +2263,35 @@ mod tests {
             app.message.as_deref(),
             Some("2 failing scheduled workflows triaged")
         );
+    }
+
+    #[test]
+    fn refresh_on_triage_tab_reruns_in_place() {
+        let mut app = app(3);
+        app.workflows[0].run_status = RunStatus::Failure;
+        app.workflows[1].run_status = RunStatus::Failure;
+        enter_command(&mut app, "triage");
+        app.handle_key(key(KeyCode::Enter));
+        complete_triage(&mut app);
+        assert_eq!(app.tabs.len(), 2);
+
+        app.active_tab_mut().workflow_ids = vec![1];
+        app.workflows[1].run_status = RunStatus::Success;
+        enter_command(&mut app, "refresh");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            app.triage_target,
+            Some(TriageTarget::RefreshTab { index: 1 })
+        ));
+        complete_triage(&mut app);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert!(app.active_tab().is_triage);
+        assert_eq!(app.active_tab().name.as_deref(), Some("Triage"));
+        assert_eq!(app.active_tab().workflow_ids, vec![1]);
+        assert_eq!(app.triage[&1].failed_jobs, "Job 1");
     }
 
     #[test]
