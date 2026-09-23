@@ -23,9 +23,10 @@ the visible area.
 The status indicator flashes every half second while the workflow has a run in
 progress.
 
-Workflow and run data load in the background. While loading, the bottom bar
-replaces the normal keybinding summary with a loading status. The interface
-remains responsive, including while `:e` refreshes a saved view.
+Workflow and run data load in the background and refresh every 15 seconds by
+default. The bottom bar always displays the configured refresh rate. While
+loading or refreshing, it replaces the normal keybinding summary with the
+current operation. The interface remains responsive during background work.
 
 ## Keyboard shortcuts
 
@@ -62,6 +63,8 @@ to execute a command or Escape to return to Normal mode.
 | `:w [path]` | Save the repository and displayed workflows as JSON |
 | `:wq [path]` | Save the view, then exit if the write succeeds |
 | `:e [path]` | Load a saved view and refresh its workflows from GitHub |
+| `:refresh` | Refresh workflow and run data immediately |
+| `:refresh-rate N` | Refresh automatically every `N` seconds |
 | `:d` | Delete the selected workflow from the view |
 | `:dN` | Delete `N` consecutive workflows starting at the selection |
 

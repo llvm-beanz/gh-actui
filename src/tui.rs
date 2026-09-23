@@ -29,6 +29,7 @@ use crate::{
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_FLASH_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -41,6 +42,14 @@ struct PendingLoad {
     repository: Repository,
     workflow_ids: Option<Vec<u64>>,
     state_path: Option<PathBuf>,
+    kind: LoadKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadKind {
+    Initial,
+    Edit,
+    Refresh,
 }
 
 struct App {
@@ -61,6 +70,8 @@ struct App {
     pending_g: bool,
     should_quit: bool,
     animation_started: Instant,
+    refresh_interval: Duration,
+    next_refresh: Instant,
 }
 
 impl App {
@@ -89,6 +100,8 @@ impl App {
             pending_g: false,
             should_quit: false,
             animation_started: Instant::now(),
+            refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
         }
     }
 
@@ -103,6 +116,7 @@ impl App {
             repository,
             workflow_ids,
             state_path,
+            kind: LoadKind::Initial,
         });
         app
     }
@@ -110,6 +124,7 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.should_quit {
             self.poll_loading();
+            self.refresh_if_due();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(EVENT_POLL_INTERVAL)?
@@ -159,31 +174,77 @@ impl App {
 
         match result {
             Ok(workflows) => {
+                let selected_id = self
+                    .table_state
+                    .selected()
+                    .and_then(|index| self.workflows.get(index))
+                    .map(|workflow| workflow.id);
                 self.repository = pending.repository;
                 self.workflows = match pending.workflow_ids {
                     Some(workflow_ids) => ViewState::resolve_workflows(&workflow_ids, workflows),
                     None => workflows,
                 };
                 self.state_path = pending.state_path;
-                self.table_state =
-                    TableState::default().with_selected((!self.workflows.is_empty()).then_some(0));
-                self.message = Some(format!("{} workflows loaded", self.workflows.len()));
+                let selected = selected_id
+                    .and_then(|id| self.workflows.iter().position(|workflow| workflow.id == id))
+                    .or_else(|| (!self.workflows.is_empty()).then_some(0));
+                self.table_state = TableState::default().with_selected(selected);
+                self.message = Some(match pending.kind {
+                    LoadKind::Refresh => format!("{} workflows refreshed", self.workflows.len()),
+                    LoadKind::Initial | LoadKind::Edit => {
+                        format!("{} workflows loaded", self.workflows.len())
+                    }
+                });
             }
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
+        self.next_refresh = Instant::now() + self.refresh_interval;
     }
 
     fn is_loading(&self) -> bool {
         self.pending_load.is_some()
     }
 
+    fn refresh_if_due(&mut self) {
+        if !self.is_loading() && Instant::now() >= self.next_refresh {
+            self.refresh();
+        }
+    }
+
+    fn refresh(&mut self) {
+        if self.is_loading() {
+            self.message = Some("Refresh already in progress".to_owned());
+            return;
+        }
+
+        self.start_loading(PendingLoad {
+            repository: self.repository.clone(),
+            workflow_ids: Some(self.workflows.iter().map(|workflow| workflow.id).collect()),
+            state_path: self.state_path.clone(),
+            kind: LoadKind::Refresh,
+        });
+    }
+
+    fn refresh_rate_label(&self) -> String {
+        format!("refresh: {}s", self.refresh_interval.as_secs())
+    }
+
     fn normal_status(&self) -> (&'static str, String) {
         if let Some(pending) = self.pending_load.as_ref() {
+            let action = match pending.kind {
+                LoadKind::Refresh => "Refreshing",
+                LoadKind::Initial | LoadKind::Edit => "Loading",
+            };
             (
-                " LOADING ",
+                if pending.kind == LoadKind::Refresh {
+                    " REFRESHING "
+                } else {
+                    " LOADING "
+                },
                 format!(
-                    "Loading workflows and run status for {}...",
-                    pending.repository
+                    "{action} workflows and run status for {}...  |  {}",
+                    pending.repository,
+                    self.refresh_rate_label()
                 ),
             )
         } else {
@@ -192,7 +253,9 @@ impl App {
                 self.message
                     .as_deref()
                     .unwrap_or("j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  gg/G: jump  |  :q: quit")
-                    .to_owned(),
+                    .to_owned()
+                    + "  |  "
+                    + &self.refresh_rate_label(),
             )
         }
     }
@@ -305,6 +368,8 @@ impl App {
                 }
             }
             "e" => self.edit_state(argument),
+            "refresh" if argument.is_none() => self.refresh(),
+            "refresh-rate" => self.set_refresh_rate(argument),
             "" => {}
             _ => self.message = Some(format!("E492: Not an editor command: {command}")),
         }
@@ -384,9 +449,29 @@ impl App {
                 repository: state.repository,
                 workflow_ids: Some(state.workflow_ids),
                 state_path: Some(path),
+                kind: LoadKind::Edit,
             }),
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
+    }
+
+    fn set_refresh_rate(&mut self, argument: Option<&str>) {
+        let Some(argument) = argument.filter(|argument| !argument.is_empty()) else {
+            self.message = Some("E471: Argument required".to_owned());
+            return;
+        };
+        let Ok(seconds) = argument.parse::<u64>() else {
+            self.message = Some(format!("E474: Invalid argument: {argument}"));
+            return;
+        };
+        if seconds == 0 {
+            self.message = Some("E474: Refresh rate must be greater than zero".to_owned());
+            return;
+        }
+
+        self.refresh_interval = Duration::from_secs(seconds);
+        self.next_refresh = Instant::now() + self.refresh_interval;
+        self.message = Some(format!("Refresh rate set to {seconds} seconds"));
     }
 
     fn backspace_command(&mut self) {
@@ -535,8 +620,11 @@ impl App {
                 frame.render_widget(help, help_area);
             }
             Mode::Command => {
-                let command = Paragraph::new(format!(":{}", self.command))
-                    .block(Block::default().borders(Borders::ALL).title(" COMMAND "));
+                let command = Paragraph::new(format!(":{}", self.command)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" COMMAND | {} ", self.refresh_rate_label())),
+                );
                 frame.render_widget(command, help_area);
 
                 let cursor_x = help_area
@@ -716,7 +804,8 @@ mod tests {
             app.normal_status(),
             (
                 " LOADING ",
-                "Loading workflows and run status for owner/repository...".to_owned()
+                "Loading workflows and run status for owner/repository...  |  refresh: 15s"
+                    .to_owned()
             )
         );
 
@@ -741,6 +830,73 @@ mod tests {
         let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
         assert_eq!(ids, vec![3, 1]);
         assert_eq!(app.state_path, Some(PathBuf::from("saved-view.json")));
+    }
+
+    #[test]
+    fn refresh_command_updates_current_workflows_in_background() {
+        let mut app = app(2);
+        app.workflows[0].name = "Stale Workflow".to_owned();
+        app.select_next(1);
+
+        enter_command(&mut app, "refresh");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.is_loading());
+        assert_eq!(app.pending_load.as_ref().unwrap().kind, LoadKind::Refresh);
+        assert_eq!(app.normal_status().0, " REFRESHING ");
+        complete_loading(&mut app);
+
+        assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
+        assert_eq!(app.table_state.selected(), Some(1));
+        assert_eq!(app.message.as_deref(), Some("2 workflows refreshed"));
+    }
+
+    #[test]
+    fn refresh_starts_automatically_when_interval_elapses() {
+        let mut app = app(2);
+        app.next_refresh = Instant::now() - Duration::from_millis(1);
+
+        app.refresh_if_due();
+
+        assert!(app.is_loading());
+        assert_eq!(app.pending_load.as_ref().unwrap().kind, LoadKind::Refresh);
+        complete_loading(&mut app);
+    }
+
+    #[test]
+    fn refresh_rate_command_changes_interval_and_footer() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "refresh-rate 30");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.refresh_interval, Duration::from_secs(30));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Refresh rate set to 30 seconds")
+        );
+        assert!(app.normal_status().1.ends_with("refresh: 30s"));
+    }
+
+    #[test]
+    fn refresh_rate_command_rejects_missing_invalid_and_zero_values() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "refresh-rate");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.message.as_deref(), Some("E471: Argument required"));
+
+        enter_command(&mut app, "refresh-rate fast");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.message.as_deref(), Some("E474: Invalid argument: fast"));
+
+        enter_command(&mut app, "refresh-rate 0");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("E474: Refresh rate must be greater than zero")
+        );
+        assert_eq!(app.refresh_interval, DEFAULT_REFRESH_INTERVAL);
     }
 
     #[test]
