@@ -1,5 +1,6 @@
 use std::{process::Command, thread};
 
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -17,6 +18,8 @@ pub struct Workflow {
     pub run_status: RunStatus,
     #[serde(skip)]
     pub is_in_progress: bool,
+    #[serde(skip)]
+    pub run_metrics: RunMetrics,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -25,6 +28,30 @@ pub enum RunStatus {
     Failure,
     #[default]
     Other,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunMetrics {
+    pub last_24_hours: RunCounts,
+    pub last_7_days: RunCounts,
+    pub last_14_days: RunCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunCounts {
+    pub passed: u32,
+    pub failed: u32,
+    pub total: u32,
+}
+
+impl RunCounts {
+    pub fn pass_percentage(self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            f64::from(self.passed) / f64::from(self.total) * 100.0
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +68,7 @@ struct WorkflowRunPage {
 struct WorkflowRun {
     status: Option<String>,
     conclusion: Option<String>,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Error)]
@@ -67,7 +95,7 @@ impl WorkflowSource for GhWorkflowSource {
         let workflow_output = run_gh(&["api", "--paginate", "--slurp", &workflows_path])?;
         let mut workflows = parse_workflows(&successful_stdout(workflow_output)?)?;
 
-        load_run_statuses(repository, &mut workflows)?;
+        load_run_statuses(repository, &mut workflows, Utc::now())?;
 
         Ok(workflows)
     }
@@ -115,14 +143,18 @@ fn parse_workflows(response: &[u8]) -> Result<Vec<Workflow>, Error> {
         .collect())
 }
 
-fn load_run_statuses(repository: &Repository, workflows: &mut [Workflow]) -> Result<(), Error> {
+fn load_run_statuses(
+    repository: &Repository,
+    workflows: &mut [Workflow],
+    now: DateTime<Utc>,
+) -> Result<(), Error> {
     for chunk in workflows.chunks_mut(MAX_CONCURRENT_REQUESTS) {
         let summaries = thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .iter()
                 .map(|workflow| {
                     let runs_path = repository.workflow_runs_api_path(workflow.id);
-                    scope.spawn(move || fetch_run_status(&runs_path))
+                    scope.spawn(move || fetch_run_status(&runs_path, now))
                 })
                 .collect();
 
@@ -135,25 +167,43 @@ fn load_run_statuses(repository: &Repository, workflows: &mut [Workflow]) -> Res
         for (workflow, summary) in chunk.iter_mut().zip(summaries) {
             workflow.run_status = summary.run_status;
             workflow.is_in_progress = summary.is_in_progress;
+            workflow.run_metrics = summary.run_metrics;
         }
     }
 
     Ok(())
 }
 
-fn fetch_run_status(runs_path: &str) -> Result<RunSummary, Error> {
-    let output = run_gh(&["api", runs_path])?;
-    let page: WorkflowRunPage = serde_json::from_slice(&successful_stdout(output)?)?;
-    Ok(summarize_runs(page.workflow_runs))
+fn fetch_run_status(runs_path: &str, now: DateTime<Utc>) -> Result<RunSummary, Error> {
+    let created = format!("created=>={}", (now - Duration::days(14)).to_rfc3339());
+    let output = run_gh(&[
+        "api",
+        "--paginate",
+        "--slurp",
+        "-X",
+        "GET",
+        "-f",
+        &created,
+        runs_path,
+    ])?;
+    let pages: Vec<WorkflowRunPage> = serde_json::from_slice(&successful_stdout(output)?)?;
+    Ok(summarize_runs(
+        pages
+            .into_iter()
+            .flat_map(|page| page.workflow_runs)
+            .collect(),
+        now,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RunSummary {
     run_status: RunStatus,
     is_in_progress: bool,
+    run_metrics: RunMetrics,
 }
 
-fn summarize_runs(runs: Vec<WorkflowRun>) -> RunSummary {
+fn summarize_runs(runs: Vec<WorkflowRun>, now: DateTime<Utc>) -> RunSummary {
     let mut summary = RunSummary::default();
     let mut found_completed = false;
     for run in runs {
@@ -169,14 +219,57 @@ fn summarize_runs(runs: Vec<WorkflowRun>) -> RunSummary {
             };
             found_completed = true;
         }
+
+        if run.status.as_deref() == Some("completed") {
+            let age = now.signed_duration_since(run.created_at);
+            if age <= Duration::days(14) {
+                record_run(
+                    &mut summary.run_metrics.last_14_days,
+                    run.conclusion.as_deref(),
+                );
+            }
+            if age <= Duration::days(7) {
+                record_run(
+                    &mut summary.run_metrics.last_7_days,
+                    run.conclusion.as_deref(),
+                );
+            }
+            if age <= Duration::hours(24) {
+                record_run(
+                    &mut summary.run_metrics.last_24_hours,
+                    run.conclusion.as_deref(),
+                );
+            }
+        }
     }
 
     summary
 }
 
+fn record_run(counts: &mut RunCounts, conclusion: Option<&str>) {
+    counts.total += 1;
+    match conclusion {
+        Some("success") => counts.passed += 1,
+        Some("failure") => counts.failed += 1,
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn now() -> DateTime<Utc> {
+        "2026-09-23T12:00:00Z".parse().unwrap()
+    }
+
+    fn run(status: &str, conclusion: Option<&str>, age: Duration) -> WorkflowRun {
+        WorkflowRun {
+            status: Some(status.to_owned()),
+            conclusion: conclusion.map(str::to_owned),
+            created_at: now() - age,
+        }
+    }
 
     #[test]
     fn parse_workflows_combines_paginated_responses() {
@@ -248,21 +341,12 @@ mod tests {
     #[test]
     fn summarize_runs_uses_latest_completed_run() {
         let runs = vec![
-            WorkflowRun {
-                status: Some("completed".to_owned()),
-                conclusion: Some("success".to_owned()),
-            },
-            WorkflowRun {
-                status: Some("completed".to_owned()),
-                conclusion: Some("failure".to_owned()),
-            },
-            WorkflowRun {
-                status: Some("completed".to_owned()),
-                conclusion: Some("failure".to_owned()),
-            },
+            run("completed", Some("success"), Duration::hours(1)),
+            run("completed", Some("failure"), Duration::hours(2)),
+            run("completed", Some("failure"), Duration::hours(3)),
         ];
 
-        let summary = summarize_runs(runs);
+        let summary = summarize_runs(runs, now());
 
         assert_eq!(summary.run_status, RunStatus::Success);
     }
@@ -270,17 +354,11 @@ mod tests {
     #[test]
     fn summarize_runs_marks_any_in_progress_run() {
         let runs = vec![
-            WorkflowRun {
-                status: Some("in_progress".to_owned()),
-                conclusion: None,
-            },
-            WorkflowRun {
-                status: Some("completed".to_owned()),
-                conclusion: Some("success".to_owned()),
-            },
+            run("in_progress", None, Duration::minutes(5)),
+            run("completed", Some("success"), Duration::hours(1)),
         ];
 
-        let summary = summarize_runs(runs);
+        let summary = summarize_runs(runs, now());
 
         assert!(summary.is_in_progress);
         assert_eq!(summary.run_status, RunStatus::Success);
@@ -288,12 +366,59 @@ mod tests {
 
     #[test]
     fn summarize_runs_uses_other_without_completed_run() {
-        let summary = summarize_runs(vec![WorkflowRun {
-            status: Some("queued".to_owned()),
-            conclusion: None,
-        }]);
+        let summary = summarize_runs(vec![run("queued", None, Duration::minutes(5))], now());
 
         assert_eq!(summary.run_status, RunStatus::Other);
         assert!(!summary.is_in_progress);
+    }
+
+    #[test]
+    fn summarize_runs_counts_completed_runs_in_time_windows() {
+        let runs = vec![
+            run("completed", Some("success"), Duration::hours(2)),
+            run("completed", Some("failure"), Duration::days(3)),
+            run("completed", Some("cancelled"), Duration::days(10)),
+            run("in_progress", None, Duration::minutes(5)),
+            run("completed", Some("success"), Duration::days(15)),
+        ];
+
+        let summary = summarize_runs(runs, now());
+
+        assert_eq!(
+            summary.run_metrics.last_24_hours,
+            RunCounts {
+                passed: 1,
+                failed: 0,
+                total: 1
+            }
+        );
+        assert_eq!(
+            summary.run_metrics.last_7_days,
+            RunCounts {
+                passed: 1,
+                failed: 1,
+                total: 2
+            }
+        );
+        assert_eq!(
+            summary.run_metrics.last_14_days,
+            RunCounts {
+                passed: 1,
+                failed: 1,
+                total: 3
+            }
+        );
+    }
+
+    #[test]
+    fn pass_percentage_uses_total_completed_runs() {
+        let counts = RunCounts {
+            passed: 10,
+            failed: 15,
+            total: 28,
+        };
+
+        assert!((counts.pass_percentage() - 35.714).abs() < 0.001);
+        assert_eq!(RunCounts::default().pass_percentage(), 0.0);
     }
 }

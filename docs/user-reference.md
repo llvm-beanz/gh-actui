@@ -23,6 +23,18 @@ the visible area.
 The status indicator flashes every half second while the workflow has a run in
 progress.
 
+The 24 Hours, 7 Days, and 14 Days columns summarize completed runs as:
+
+```text
+passed/failed/total pass%
+10/15/28 35.7%
+```
+
+The total includes every completed run conclusion, while passed and failed
+count only `success` and `failure`. In-progress runs are not included. Rates
+below 70% are red, rates below 90% are yellow, and rates of 90% or higher are
+green.
+
 Workflow and run data load in the background and refresh every 15 seconds by
 default. The bottom bar always displays the configured refresh rate. While
 loading or refreshing, it replaces the normal keybinding summary with the

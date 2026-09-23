@@ -7,6 +7,7 @@ edition = "2024"
 resolver = "2"
 
 [workspace.dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
@@ -16,6 +17,7 @@ thiserror = "2.0.16"
 url = "2.5.7"
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true

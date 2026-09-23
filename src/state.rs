@@ -129,6 +129,7 @@ mod tests {
                 state: "active".to_owned(),
                 run_status: crate::github::RunStatus::Success,
                 is_in_progress: true,
+                run_metrics: crate::github::RunMetrics::default(),
             },
             Workflow {
                 id: 7,
@@ -137,6 +138,7 @@ mod tests {
                 state: "active".to_owned(),
                 run_status: crate::github::RunStatus::Failure,
                 is_in_progress: false,
+                run_metrics: crate::github::RunMetrics::default(),
             },
         ];
         ViewState::new("owner/repository".parse().unwrap(), &workflows)
@@ -176,6 +178,7 @@ mod tests {
                 state: "active".to_owned(),
                 run_status: crate::github::RunStatus::Success,
                 is_in_progress: true,
+                run_metrics: crate::github::RunMetrics::default(),
             },
             Workflow {
                 id: 42,
@@ -184,6 +187,7 @@ mod tests {
                 state: "active".to_owned(),
                 run_status: crate::github::RunStatus::Failure,
                 is_in_progress: false,
+                run_metrics: crate::github::RunMetrics::default(),
             },
         ];
 

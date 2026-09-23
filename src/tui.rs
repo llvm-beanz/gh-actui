@@ -22,7 +22,7 @@ use ratatui::{
 };
 
 use crate::{
-    github::{RunStatus, Workflow, WorkflowSource},
+    github::{RunCounts, RunStatus, Workflow, WorkflowSource},
     repository::Repository,
     state::ViewState,
 };
@@ -579,7 +579,7 @@ impl App {
             );
             frame.render_widget(empty, table_area);
         } else {
-            let header = Row::new(["Status", "Name"])
+            let header = Row::new(["Status", "Name", "24 Hours", "7 Days", "14 Days"])
                 .style(
                     Style::default()
                         .fg(Color::Cyan)
@@ -591,22 +591,33 @@ impl App {
                 Row::new([
                     Cell::from(status_indicator(workflow, flash_visible)),
                     Cell::from(workflow.name.as_str()),
+                    metrics_cell(workflow.run_metrics.last_24_hours),
+                    metrics_cell(workflow.run_metrics.last_7_days),
+                    metrics_cell(workflow.run_metrics.last_14_days),
                 ])
             });
-            let table = Table::new(rows, [Constraint::Length(8), Constraint::Min(20)])
-                .header(header)
-                .row_highlight_style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol(">> ")
-                .block(Block::default().borders(Borders::ALL).title(format!(
-                    " {} - {} active workflows ",
-                    self.repository,
-                    self.workflows.len()
-                )));
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(8),
+                    Constraint::Min(20),
+                    Constraint::Length(19),
+                    Constraint::Length(19),
+                    Constraint::Length(19),
+                ],
+            )
+            .header(header)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ")
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " {} - {} active workflows ",
+                self.repository,
+                self.workflows.len()
+            )));
 
             frame.render_stateful_widget(table, table_area, &mut self.table_state);
         }
@@ -680,6 +691,25 @@ fn status_indicator(workflow: &Workflow, flash_visible: bool) -> &'static str {
     }
 }
 
+fn metrics_cell(counts: RunCounts) -> Cell<'static> {
+    let percentage = counts.pass_percentage();
+    Cell::from(format!(
+        "{}/{}/{} {:.1}%",
+        counts.passed, counts.failed, counts.total, percentage
+    ))
+    .style(Style::default().fg(metrics_color(percentage)))
+}
+
+fn metrics_color(percentage: f64) -> Color {
+    if percentage < 70.0 {
+        Color::Red
+    } else if percentage < 90.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
 fn flash_visible(elapsed: Duration) -> bool {
     (elapsed.as_millis() / STATUS_FLASH_INTERVAL.as_millis()).is_multiple_of(2)
 }
@@ -748,6 +778,7 @@ mod tests {
             state: "active".to_owned(),
             run_status: RunStatus::Other,
             is_in_progress: false,
+            run_metrics: crate::github::RunMetrics::default(),
         }
     }
 
@@ -1175,5 +1206,13 @@ mod tests {
         assert!(flash_visible(Duration::from_millis(499)));
         assert!(!flash_visible(Duration::from_millis(500)));
         assert!(flash_visible(Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn metrics_color_uses_requested_thresholds() {
+        assert_eq!(metrics_color(69.9), Color::Red);
+        assert_eq!(metrics_color(70.0), Color::Yellow);
+        assert_eq!(metrics_color(89.9), Color::Yellow);
+        assert_eq!(metrics_color(90.0), Color::Green);
     }
 }
