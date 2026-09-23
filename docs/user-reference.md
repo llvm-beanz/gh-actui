@@ -56,6 +56,7 @@ to execute a command or Escape to return to Normal mode.
 | --- | --- |
 | `:q` | Exit |
 | `:w [path]` | Save the repository and displayed workflows as JSON |
+| `:wq [path]` | Save the view, then exit if the write succeeds |
 | `:e [path]` | Load a saved view and refresh its workflows from GitHub |
 | `:d` | Delete the selected workflow from the view |
 | `:dN` | Delete `N` consecutive workflows starting at the selection |
@@ -66,10 +67,10 @@ Deletion affects only the current view. Use `:w` to persist the updated
 workflow list. If the requested count extends past the end of the table, all
 remaining rows are deleted.
 
-After `:w path` or `:e path` succeeds, that path is remembered. Later `:w` or
-`:e` commands without a path reuse it. A state file supplied on the command
-line is also remembered. Using `:w` or `:e` without a remembered path reports
-an error.
+After `:w path`, `:wq path`, or `:e path` succeeds, that path is remembered.
+Later write or edit commands without a path reuse it. A state file supplied on
+the command line is also remembered. Using `:w`, `:wq`, or `:e` without a
+remembered path reports an error. `:wq` does not exit if saving fails.
 
 State files contain only the repository identity and the IDs of the workflows
 in the view. Workflow names, paths, enablement state, and run status are not

@@ -187,7 +187,15 @@ impl<'a> App<'a> {
                 self.should_quit = true;
                 return;
             }
-            "w" => self.write_state(argument),
+            "w" => {
+                self.write_state(argument);
+            }
+            "wq" => {
+                if self.write_state(argument) {
+                    self.should_quit = true;
+                    return;
+                }
+            }
             "e" => self.edit_state(argument),
             "" => {}
             _ => self.message = Some(format!("E492: Not an editor command: {command}")),
@@ -227,12 +235,12 @@ impl<'a> App<'a> {
         });
     }
 
-    fn write_state(&mut self, argument: Option<&str>) {
+    fn write_state(&mut self, argument: Option<&str>) -> bool {
         let path = match command_path(argument, self.state_path.as_ref()) {
             Ok(path) => path,
             Err(message) => {
                 self.message = Some(message);
-                return;
+                return false;
             }
         };
 
@@ -245,8 +253,12 @@ impl<'a> App<'a> {
                     self.workflows.len()
                 ));
                 self.state_path = Some(path);
+                true
             }
-            Err(error) => self.message = Some(format!("E212: {error}")),
+            Err(error) => {
+                self.message = Some(format!("E212: {error}"));
+                false
+            }
         }
     }
 
@@ -746,6 +758,35 @@ mod tests {
         enter_command(&mut app, "w");
         app.handle_key(key(KeyCode::Enter));
 
+        assert_eq!(app.message.as_deref(), Some("E32: No file name"));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn write_quit_command_saves_then_quits() {
+        let path = std::env::temp_dir().join(format!(
+            "gh-actui-write-quit-state-{}.json",
+            std::process::id()
+        ));
+        let mut app = app(2);
+
+        enter_command(&mut app, &format!("wq {}", path.display()));
+        app.handle_key(key(KeyCode::Enter));
+        let saved = ViewState::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(app.should_quit);
+        assert_eq!(saved.workflow_ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn write_quit_command_does_not_quit_when_write_fails() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "wq");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(!app.should_quit);
         assert_eq!(app.message.as_deref(), Some("E32: No file name"));
         assert_eq!(app.mode, Mode::Normal);
     }
