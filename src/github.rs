@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::repository::Repository;
 
 const MAX_CONCURRENT_REQUESTS: usize = 8;
+const RUNS_PER_PAGE: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Workflow {
@@ -175,25 +176,42 @@ fn load_run_statuses(
 }
 
 fn fetch_run_status(runs_path: &str, now: DateTime<Utc>) -> Result<RunSummary, Error> {
-    let created = format!("created=>={}", (now - Duration::days(14)).to_rfc3339());
-    let output = run_gh(&[
-        "api",
-        "--paginate",
-        "--slurp",
-        "-X",
-        "GET",
-        "-f",
-        &created,
-        runs_path,
-    ])?;
-    let pages: Vec<WorkflowRunPage> = serde_json::from_slice(&successful_stdout(output)?)?;
-    Ok(summarize_runs(
-        pages
-            .into_iter()
-            .flat_map(|page| page.workflow_runs)
-            .collect(),
-        now,
-    ))
+    fetch_run_status_with(runs_path, now, |path| {
+        successful_stdout(run_gh(&["api", "-X", "GET", path])?)
+    })
+}
+
+fn fetch_run_status_with(
+    runs_path: &str,
+    now: DateTime<Utc>,
+    mut fetch_page: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<RunSummary, Error> {
+    let cutoff = now - Duration::days(14);
+    let mut runs = Vec::new();
+    let mut page_number = 1;
+    let mut found_completed = false;
+
+    loop {
+        // GitHub's server-side `created` filter can return stale workflow-run
+        // results for workflows with large histories. Fetch the unfiltered,
+        // newest-first stream and enforce the time window locally instead.
+        let page_path = format!("{runs_path}&page={page_number}");
+        let page: WorkflowRunPage = serde_json::from_slice(&fetch_page(&page_path)?)?;
+        let page_len = page.workflow_runs.len();
+        let reached_cutoff = page.workflow_runs.iter().any(|run| run.created_at < cutoff);
+        found_completed |= page
+            .workflow_runs
+            .iter()
+            .any(|run| run.status.as_deref() == Some("completed"));
+        runs.extend(page.workflow_runs);
+
+        if page_len < RUNS_PER_PAGE || (reached_cutoff && found_completed) {
+            break;
+        }
+        page_number += 1;
+    }
+
+    Ok(summarize_runs(runs, now))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -257,6 +275,10 @@ fn record_run(counts: &mut RunCounts, conclusion: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use serde_json::json;
+
     use super::*;
 
     fn now() -> DateTime<Utc> {
@@ -408,6 +430,79 @@ mod tests {
                 total: 3
             }
         );
+    }
+
+    #[test]
+    fn fetch_run_status_pages_unfiltered_results_until_cutoff_and_completion() {
+        let recent_queued = (0..RUNS_PER_PAGE)
+            .map(|_| {
+                json!({
+                    "status": "queued",
+                    "conclusion": null,
+                    "created_at": (now() - Duration::hours(1)).to_rfc3339()
+                })
+            })
+            .collect::<Vec<_>>();
+        let old_completed = json!([{
+            "status": "completed",
+            "conclusion": "failure",
+            "created_at": (now() - Duration::days(15)).to_rfc3339()
+        }]);
+        let mut responses = VecDeque::from([
+            serde_json::to_vec(&json!({"workflow_runs": recent_queued})).unwrap(),
+            serde_json::to_vec(&json!({"workflow_runs": old_completed})).unwrap(),
+        ]);
+        let mut requested_paths = Vec::new();
+
+        let summary = fetch_run_status_with(
+            "repos/owner/repo/actions/workflows/42/runs?per_page=100",
+            now(),
+            |path| {
+                requested_paths.push(path.to_owned());
+                Ok(responses.pop_front().unwrap())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            requested_paths,
+            [
+                "repos/owner/repo/actions/workflows/42/runs?per_page=100&page=1",
+                "repos/owner/repo/actions/workflows/42/runs?per_page=100&page=2"
+            ]
+        );
+        assert!(requested_paths.iter().all(|path| !path.contains("created")));
+        assert_eq!(summary.run_status, RunStatus::Failure);
+        assert_eq!(summary.run_metrics.last_14_days.total, 0);
+    }
+
+    #[test]
+    fn fetch_run_status_stops_after_full_page_crosses_cutoff() {
+        let mut runs = (0..RUNS_PER_PAGE - 1)
+            .map(|_| {
+                json!({
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": (now() - Duration::hours(1)).to_rfc3339()
+                })
+            })
+            .collect::<Vec<_>>();
+        runs.push(json!({
+            "status": "completed",
+            "conclusion": "failure",
+            "created_at": (now() - Duration::days(15)).to_rfc3339()
+        }));
+        let response = serde_json::to_vec(&json!({"workflow_runs": runs})).unwrap();
+        let mut request_count = 0;
+
+        let summary = fetch_run_status_with("runs?per_page=100", now(), |_| {
+            request_count += 1;
+            Ok(response.clone())
+        })
+        .unwrap();
+
+        assert_eq!(request_count, 1);
+        assert_eq!(summary.run_metrics.last_14_days.total, 99);
     }
 
     #[test]

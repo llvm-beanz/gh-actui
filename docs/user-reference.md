@@ -35,6 +35,12 @@ count only `success` and `failure`. In-progress runs are not included. Rates
 below 70% are red, rates below 90% are yellow, and rates of 90% or higher are
 green.
 
+GitHub's server-side `created` filter for workflow runs can return stale
+results for workflows with large run histories. `gh-actui` therefore fetches
+the unfiltered workflow-run endpoint in newest-first pages and applies the
+14-day cutoff locally. Pagination stops after passing that cutoff and finding
+the latest completed run.
+
 Workflow and run data load in the background and refresh every 15 seconds by
 default. The bottom bar always displays the configured refresh rate. While
 loading or refreshing, it replaces the normal keybinding summary with the
