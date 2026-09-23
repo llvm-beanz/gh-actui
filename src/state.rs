@@ -12,6 +12,43 @@ use crate::{github::Workflow, repository::Repository};
 const CURRENT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewPane {
+    pub workflow_ids: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_workflow_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ViewLayout {
+    Pane {
+        index: usize,
+    },
+    Split {
+        direction: SplitDirection,
+        first: Box<ViewLayout>,
+        second: Box<ViewLayout>,
+    },
+}
+
+impl Default for ViewLayout {
+    fn default() -> Self {
+        Self::Pane { index: 0 }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ViewTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -22,6 +59,20 @@ pub struct ViewTab {
     pub sort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_workflow_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_views: Vec<ViewPane>,
+    #[serde(default, skip_serializing_if = "is_default_layout")]
+    pub layout: ViewLayout,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub active_view: usize,
+}
+
+fn is_default_layout(layout: &ViewLayout) -> bool {
+    layout == &ViewLayout::default()
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -70,6 +121,8 @@ pub enum Error {
     },
     #[error("state file version {found} is not supported (expected {CURRENT_VERSION})")]
     UnsupportedVersion { found: u32 },
+    #[error("state file contains an invalid split layout in tab {tab}")]
+    InvalidLayout { tab: usize },
     #[error("could not serialize view state: {0}")]
     Serialize(serde_json::Error),
     #[error("could not write state file {path}: {source}")]
@@ -127,7 +180,15 @@ impl ViewState {
                 filter: stored.filter,
                 sort: stored.sort,
                 selected_workflow_id: None,
+                additional_views: Vec::new(),
+                layout: ViewLayout::default(),
+                active_view: 0,
             });
+        }
+        for (index, tab) in tabs.iter().enumerate() {
+            if !Self::valid_tab_layout(tab) {
+                return Err(Error::InvalidLayout { tab: index + 1 });
+            }
         }
         Ok(Self {
             version: stored.version,
@@ -136,6 +197,26 @@ impl ViewState {
             active_tab: stored.active_tab.min(tabs.len().saturating_sub(1)),
             tabs,
         })
+    }
+
+    fn valid_tab_layout(tab: &ViewTab) -> bool {
+        let view_count = 1 + tab.additional_views.len();
+        if tab.active_view >= view_count {
+            return false;
+        }
+        fn collect(layout: &ViewLayout, indexes: &mut Vec<usize>) {
+            match layout {
+                ViewLayout::Pane { index } => indexes.push(*index),
+                ViewLayout::Split { first, second, .. } => {
+                    collect(first, indexes);
+                    collect(second, indexes);
+                }
+            }
+        }
+        let mut indexes = Vec::new();
+        collect(&tab.layout, &mut indexes);
+        indexes.sort_unstable();
+        indexes == (0..view_count).collect::<Vec<_>>()
     }
 
     pub fn resolve_workflows(workflow_ids: &[u64], workflows: Vec<Workflow>) -> Vec<Workflow> {
@@ -192,6 +273,9 @@ mod tests {
                 filter: Some("status:success".to_owned()),
                 sort: Some("name:desc".to_owned()),
                 selected_workflow_id: Some(7),
+                additional_views: Vec::new(),
+                layout: ViewLayout::default(),
+                active_view: 0,
             }],
             0,
         )
@@ -223,6 +307,31 @@ mod tests {
         assert!(!serialized.contains("Build"));
         assert!(!serialized.contains("build.yml"));
         assert!(!serialized.contains("run_status"));
+    }
+
+    #[test]
+    fn view_state_round_trips_split_views() {
+        let mut state = state();
+        state.tabs[0].additional_views.push(ViewPane {
+            workflow_ids: vec![7],
+            filter: Some("status:failure".to_owned()),
+            sort: Some("name".to_owned()),
+            selected_workflow_id: Some(7),
+        });
+        state.tabs[0].layout = ViewLayout::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(ViewLayout::Pane { index: 0 }),
+            second: Box::new(ViewLayout::Pane { index: 1 }),
+        };
+        state.tabs[0].active_view = 1;
+        let path =
+            std::env::temp_dir().join(format!("gh-actui-split-state-{}.json", std::process::id()));
+
+        state.save(&path).unwrap();
+        let restored = ViewState::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(restored.tabs, state.tabs);
     }
 
     #[test]

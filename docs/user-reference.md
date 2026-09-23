@@ -65,6 +65,8 @@ to execute a command or Escape to return to Normal mode.
 | `G` or End | Select the last workflow |
 | `Ctrl+Tab` | Switch to the next tab |
 | `Ctrl+Shift+Tab` | Switch to the previous tab |
+| `Ctrl-w`, then an arrow or `h`/`j`/`k`/`l` | Focus the split view in that direction |
+| Left mouse click | Focus the split view under the pointer |
 | `:` | Enter Command mode |
 
 The tab shortcuts work in both Normal and Command modes.
@@ -94,6 +96,8 @@ The tab shortcuts work in both Normal and Command modes.
 | `:filter` | Clear the active filter |
 | `:sort FIELD[:asc\|desc]` | Sort workflows by a field; ascending by default |
 | `:sort` | Clear the active sort |
+| `:split horizontal` | Duplicate the active list view in a top/bottom split |
+| `:split vertical` | Duplicate the active list view in a side-by-side split |
 | `:tabnew [name]` | Duplicate the active workflow view in an optionally named tab |
 | `:tabsetname NAME` | Change the active tab's displayed name |
 | `:tabnext` or `:tabn` | Switch to the next tab |
@@ -105,15 +109,17 @@ The tab shortcuts work in both Normal and Command modes.
 
 There is no single-key quit binding in Normal mode.
 
-Deletion affects only the active tab; the process-wide workflow data remains
-available to other tabs. Use `:w` to persist the updated tab. If the requested
-count extends past the end of the table, all remaining rows are deleted.
+Deletion affects only the active view; the process-wide workflow data remains
+available to other views and tabs. Use `:w` to persist the updated view. If the
+requested count extends past the end of the table, all remaining rows are
+deleted.
 
 ### Tabs
 
 The process fetches and refreshes one global workflow collection for the
-repository. Tabs are lightweight views over that collection. Each tab has its
-own workflow subset, selected row, filter, and sort.
+repository. Tabs are lightweight views over that collection. A tab contains
+one or more list views, and each list view has its own workflow subset,
+selected row, filter, and sort.
 
 `:tabnew [name]` duplicates the active tab and switches to the duplicate
 without performing another network request. The optional argument, including
@@ -123,6 +129,14 @@ Unlike `ghui`, the `:tabnew` argument is not interpreted as a URL because one
 `gh-actui` process monitors only one repository. Tab navigation wraps at either
 end. Closing the only tab resets it to an empty view instead of exiting the
 application.
+
+`:split horizontal` duplicates the active list view below it.
+`:split vertical` duplicates it to the right. Splitting can be repeated to
+create nested layouts. The active view has a cyan border; inactive views have
+dim borders. Use `Ctrl-w` followed by an arrow key or `h`, `j`, `k`, or `l` to
+move focus geometrically, or click a view with the left mouse button. Commands
+such as `:filter`, `:sort`, `:d`, and `:triage` operate on the active view.
+Triage result tabs cannot be split.
 
 ### Failure triage
 
@@ -194,7 +208,7 @@ Available fields are:
 | `<period>.rate` | Pass percentage |
 
 Periods accept `24h`, `7d`, or `14d`. Relative keywords such as `@me` are not
-supported. Filters and sorts apply only to the active tab, survive refreshes,
+supported. Filters and sorts apply only to the active view, survive refreshes,
 and are included in saved view files. `:dN` deletes rows in the current
 filtered and sorted order.
 
@@ -204,8 +218,8 @@ the command line is also remembered. Using `:w`, `:wq`, or `:e` without a
 remembered path reports an error. `:wq` does not exit if saving fails.
 
 State files contain the repository identity, the global monitored workflow
-IDs, every tab in tab-bar order, each tab's name, workflow IDs, filter, sort,
-and selected workflow, and the active tab. Workflow names, paths, enablement
-state, and run status are not saved because they may change; they are queried
-from GitHub whenever a state file is loaded. Existing single-view state files
-load as one unnamed tab.
+IDs, every tab in tab-bar order, each tab's name, split layout, active view,
+and each view's workflow IDs, filter, sort, and selected workflow. Workflow
+names, paths, enablement state, and run status are not saved because they may
+change; they are queried from GitHub whenever a state file is loaded. Existing
+single-view state files load as one unnamed tab with one view.

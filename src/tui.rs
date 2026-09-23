@@ -11,7 +11,10 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
@@ -27,7 +30,7 @@ use crate::{
     github::{RunCounts, RunStatus, Workflow, WorkflowSource, WorkflowTriage},
     query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
-    state::{ViewState, ViewTab},
+    state::{SplitDirection, ViewLayout, ViewPane, ViewState, ViewTab},
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -39,6 +42,14 @@ enum Mode {
     #[default]
     Normal,
     Command,
+}
+
+#[derive(Clone, Copy)]
+enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 struct PendingLoad {
@@ -64,14 +75,42 @@ enum TriageTarget {
 }
 
 #[derive(Clone)]
-struct Tab {
-    name: Option<String>,
+struct ListView {
     workflow_ids: Vec<u64>,
     table_state: TableState,
     filter: Option<String>,
     filter_expression: Option<FilterExpression>,
     sort: Option<String>,
     sort_spec: Option<SortSpec>,
+}
+
+impl ListView {
+    fn new(workflow_ids: Vec<u64>, filter: Option<String>, sort: Option<String>) -> Self {
+        Self {
+            table_state: TableState::default(),
+            filter_expression: filter
+                .as_deref()
+                .and_then(|expression| FilterExpression::parse(expression).ok()),
+            sort_spec: sort
+                .as_deref()
+                .and_then(|specification| SortSpec::parse(specification).ok()),
+            workflow_ids,
+            filter,
+            sort,
+        }
+    }
+
+    fn from_persisted(view: ViewPane) -> Self {
+        Self::new(view.workflow_ids, view.filter, view.sort)
+    }
+}
+
+#[derive(Clone)]
+struct Tab {
+    name: Option<String>,
+    views: Vec<ListView>,
+    layout: ViewLayout,
+    active_view: usize,
     is_triage: bool,
 }
 
@@ -84,22 +123,49 @@ impl Tab {
     ) -> Self {
         Self {
             name,
-            table_state: TableState::default(),
-            filter_expression: filter
-                .as_deref()
-                .and_then(|expression| FilterExpression::parse(expression).ok()),
-            sort_spec: sort
-                .as_deref()
-                .and_then(|specification| SortSpec::parse(specification).ok()),
-            workflow_ids,
-            filter,
-            sort,
+            views: vec![ListView::new(workflow_ids, filter, sort)],
+            layout: ViewLayout::default(),
+            active_view: 0,
             is_triage: false,
         }
     }
 
     fn from_view(tab: ViewTab) -> Self {
-        Self::new(tab.name, tab.workflow_ids, tab.filter, tab.sort)
+        let mut views = vec![ListView::new(tab.workflow_ids, tab.filter, tab.sort)];
+        views.extend(
+            tab.additional_views
+                .into_iter()
+                .map(ListView::from_persisted),
+        );
+        Self {
+            name: tab.name,
+            active_view: tab.active_view.min(views.len().saturating_sub(1)),
+            views,
+            layout: tab.layout,
+            is_triage: false,
+        }
+    }
+
+    fn active_view(&self) -> &ListView {
+        &self.views[self.active_view]
+    }
+
+    fn active_view_mut(&mut self) -> &mut ListView {
+        &mut self.views[self.active_view]
+    }
+}
+
+impl std::ops::Deref for Tab {
+    type Target = ListView;
+
+    fn deref(&self) -> &Self::Target {
+        self.active_view()
+    }
+}
+
+impl std::ops::DerefMut for Tab {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.active_view_mut()
     }
 }
 
@@ -127,6 +193,8 @@ struct App {
     animation_started: Instant,
     refresh_interval: Duration,
     next_refresh: Instant,
+    pending_ctrl_w: bool,
+    pane_areas: Vec<(usize, Rect)>,
 }
 
 impl App {
@@ -179,6 +247,8 @@ impl App {
             animation_started: Instant::now(),
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
+            pending_ctrl_w: false,
+            pane_areas: Vec::new(),
         };
         app.repair_all_tab_selections(None);
         app
@@ -211,11 +281,12 @@ impl App {
             self.refresh_if_due();
             terminal.draw(|frame| self.render(frame))?;
 
-            if event::poll(EVENT_POLL_INTERVAL)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.handle_key(key);
+            if event::poll(EVENT_POLL_INTERVAL)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    _ => {}
+                }
             }
         }
 
@@ -291,29 +362,38 @@ impl App {
                         if self.tabs.get(index).is_some_and(|tab| tab.is_triage) =>
                     {
                         let selected_id = self.tabs[index]
+                            .active_view()
                             .table_state
                             .selected()
                             .and_then(|selected| {
-                                self.visible_workflows_for(&self.tabs[index])
+                                self.visible_workflows_for(self.tabs[index].active_view())
                                     .get(selected)
                                     .copied()
                             })
                             .map(|workflow| workflow.id);
-                        self.tabs[index].workflow_ids = workflow_ids;
+                        self.tabs[index].active_view_mut().workflow_ids = workflow_ids;
                         let selected = selected_id
                             .and_then(|id| {
-                                self.visible_workflows_for(&self.tabs[index])
+                                self.visible_workflows_for(self.tabs[index].active_view())
                                     .iter()
                                     .position(|workflow| workflow.id == id)
                             })
-                            .or_else(|| (!self.tabs[index].workflow_ids.is_empty()).then_some(0));
-                        self.tabs[index].table_state.select(selected);
+                            .or_else(|| {
+                                (!self.tabs[index].active_view().workflow_ids.is_empty())
+                                    .then_some(0)
+                            });
+                        self.tabs[index]
+                            .active_view_mut()
+                            .table_state
+                            .select(selected);
                     }
                     Some(TriageTarget::NewTab { insert_after }) => {
                         let mut tab = Tab::new(Some("Triage".to_owned()), workflow_ids, None, None);
                         tab.is_triage = true;
-                        tab.table_state
-                            .select((!tab.workflow_ids.is_empty()).then_some(0));
+                        let has_workflows = !tab.active_view().workflow_ids.is_empty();
+                        tab.active_view_mut()
+                            .table_state
+                            .select(has_workflows.then_some(0));
                         let index = (insert_after + 1).min(self.tabs.len());
                         self.tabs.insert(index, tab);
                         self.active_tab = index;
@@ -361,15 +441,24 @@ impl App {
                         |tabs| {
                             tabs.into_iter()
                                 .map(|tab| {
-                                    let selected_workflow_id = tab.selected_workflow_id;
+                                    let selected_ids = std::iter::once(tab.selected_workflow_id)
+                                        .chain(
+                                            tab.additional_views
+                                                .iter()
+                                                .map(|view| view.selected_workflow_id),
+                                        )
+                                        .collect::<Vec<_>>();
                                     let mut runtime = Tab::from_view(tab);
-                                    runtime.table_state.select(selected_workflow_id.and_then(
-                                        |id| {
-                                            self.visible_workflows_for(&runtime)
+                                    for (view, selected_id) in
+                                        runtime.views.iter_mut().zip(selected_ids)
+                                    {
+                                        let selected = selected_id.and_then(|id| {
+                                            self.visible_workflows_for(view)
                                                 .iter()
                                                 .position(|workflow| workflow.id == id)
-                                        },
-                                    ));
+                                        });
+                                        view.table_state.select(selected);
+                                    }
                                     runtime
                                 })
                                 .collect()
@@ -397,18 +486,18 @@ impl App {
     }
 
     fn visible_workflows(&self) -> Vec<&Workflow> {
-        self.tabs
-            .get(self.active_tab)
-            .map_or_else(Vec::new, |tab| self.visible_workflows_for(tab))
+        self.tabs.get(self.active_tab).map_or_else(Vec::new, |tab| {
+            self.visible_workflows_for(tab.active_view())
+        })
     }
 
-    fn visible_workflows_for(&self, tab: &Tab) -> Vec<&Workflow> {
+    fn visible_workflows_for(&self, view: &ListView) -> Vec<&Workflow> {
         let mut workflows = select_workflows(
             &self.workflows,
-            tab.filter_expression.as_ref(),
-            tab.sort_spec.as_ref(),
+            view.filter_expression.as_ref(),
+            view.sort_spec.as_ref(),
         );
-        workflows.retain(|workflow| tab.workflow_ids.contains(&workflow.id));
+        workflows.retain(|workflow| view.workflow_ids.contains(&workflow.id));
         workflows
     }
 
@@ -420,39 +509,65 @@ impl App {
         &mut self.tabs[self.active_tab]
     }
 
-    fn selected_workflow_ids(&self) -> Vec<Option<u64>> {
+    fn active_view(&self) -> &ListView {
+        self.active_tab().active_view()
+    }
+
+    fn active_view_mut(&mut self) -> &mut ListView {
+        self.active_tab_mut().active_view_mut()
+    }
+
+    fn selected_workflow_ids(&self) -> Vec<Vec<Option<u64>>> {
         self.tabs
             .iter()
             .map(|tab| {
-                tab.table_state
-                    .selected()
-                    .and_then(|index| self.visible_workflows_for(tab).get(index).copied())
-                    .map(|workflow| workflow.id)
+                tab.views
+                    .iter()
+                    .map(|view| {
+                        view.table_state
+                            .selected()
+                            .and_then(|index| self.visible_workflows_for(view).get(index).copied())
+                            .map(|workflow| workflow.id)
+                    })
+                    .collect()
             })
             .collect()
     }
 
-    fn repair_all_tab_selections(&mut self, selected_ids: Option<Vec<Option<u64>>>) {
+    fn repair_all_tab_selections(&mut self, selected_ids: Option<Vec<Vec<Option<u64>>>>) {
         let selections = self
             .tabs
             .iter()
             .enumerate()
             .map(|(index, tab)| {
-                let visible = self.visible_workflows_for(tab);
-                selected_ids
-                    .as_ref()
-                    .and_then(|ids| ids.get(index).copied().flatten())
-                    .and_then(|id| visible.iter().position(|workflow| workflow.id == id))
-                    .or_else(|| {
-                        tab.table_state
-                            .selected()
-                            .filter(|selected| *selected < visible.len())
+                tab.views
+                    .iter()
+                    .enumerate()
+                    .map(|(view_index, view)| {
+                        let visible = self.visible_workflows_for(view);
+                        selected_ids
+                            .as_ref()
+                            .and_then(|ids| {
+                                ids.get(index)
+                                    .and_then(|views| views.get(view_index))
+                                    .copied()
+                                    .flatten()
+                            })
+                            .and_then(|id| visible.iter().position(|workflow| workflow.id == id))
+                            .or_else(|| {
+                                view.table_state
+                                    .selected()
+                                    .filter(|selected| *selected < visible.len())
+                            })
+                            .or_else(|| (!visible.is_empty()).then_some(0))
                     })
-                    .or_else(|| (!visible.is_empty()).then_some(0))
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        for (tab, selection) in self.tabs.iter_mut().zip(selections) {
-            tab.table_state.select(selection);
+        for (tab, tab_selections) in self.tabs.iter_mut().zip(selections) {
+            for (view, selection) in tab.views.iter_mut().zip(tab_selections) {
+                view.table_state.select(selection);
+            }
         }
     }
 
@@ -556,7 +671,26 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyEvent) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        if self.pending_ctrl_w {
+            self.pending_ctrl_w = false;
+            let direction = match key.code {
+                KeyCode::Left | KeyCode::Char('h') => Some(FocusDirection::Left),
+                KeyCode::Down | KeyCode::Char('j') => Some(FocusDirection::Down),
+                KeyCode::Up | KeyCode::Char('k') => Some(FocusDirection::Up),
+                KeyCode::Right | KeyCode::Char('l') => Some(FocusDirection::Right),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                self.move_view_focus(direction);
+            }
+            return;
+        }
+
         match key.code {
+            KeyCode::Char('w') if control => {
+                self.pending_ctrl_w = true;
+                return;
+            }
             KeyCode::Down | KeyCode::Char('j') => self.select_next(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(1),
             KeyCode::PageDown => self.select_next(10),
@@ -582,6 +716,66 @@ impl App {
         }
 
         self.pending_g = false;
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        if let Some(view) = self
+            .pane_areas
+            .iter()
+            .find(|(_, area)| area.contains((mouse.column, mouse.row).into()))
+            .map(|(view, _)| *view)
+        {
+            self.active_tab_mut().active_view = view;
+            self.message = Some(format!("View {} focused", view + 1));
+        }
+    }
+
+    fn move_view_focus(&mut self, direction: FocusDirection) {
+        let active = self.active_tab().active_view;
+        let Some((_, current)) = self.pane_areas.iter().find(|(view, _)| *view == active) else {
+            return;
+        };
+        let current_center = rect_center(*current);
+        let next = self
+            .pane_areas
+            .iter()
+            .filter(|(view, _)| *view != active)
+            .filter_map(|(view, area)| {
+                let center = rect_center(*area);
+                let primary = match direction {
+                    FocusDirection::Left if center.0 < current_center.0 => {
+                        current_center.0 - center.0
+                    }
+                    FocusDirection::Right if center.0 > current_center.0 => {
+                        center.0 - current_center.0
+                    }
+                    FocusDirection::Up if center.1 < current_center.1 => {
+                        current_center.1 - center.1
+                    }
+                    FocusDirection::Down if center.1 > current_center.1 => {
+                        center.1 - current_center.1
+                    }
+                    _ => return None,
+                };
+                let secondary = match direction {
+                    FocusDirection::Left | FocusDirection::Right => {
+                        current_center.1.abs_diff(center.1)
+                    }
+                    FocusDirection::Up | FocusDirection::Down => {
+                        current_center.0.abs_diff(center.0)
+                    }
+                };
+                Some((*view, u32::from(primary) * 10_000 + u32::from(secondary)))
+            })
+            .min_by_key(|(_, score)| *score)
+            .map(|(view, _)| view);
+        if let Some(next) = next {
+            self.active_tab_mut().active_view = next;
+            self.message = Some(format!("View {} focused", next + 1));
+        }
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) {
@@ -658,6 +852,7 @@ impl App {
             "refresh-rate" => self.set_refresh_rate(argument),
             "filter" => self.set_filter(argument),
             "sort" => self.set_sort(argument),
+            "split" => self.split_view(argument),
             "tabnew" => self.tab_new(argument),
             "tabsetname" => self.tab_set_name(argument),
             "triage" if argument.is_none() => self.start_triage(),
@@ -680,7 +875,7 @@ impl App {
     }
 
     fn delete_rows(&mut self, count: usize) {
-        let Some(selected) = self.active_tab().table_state.selected() else {
+        let Some(selected) = self.active_view().table_state.selected() else {
             self.message = Some("E749: Empty buffer".to_owned());
             return;
         };
@@ -693,7 +888,7 @@ impl App {
             .map(|workflow| workflow.id)
             .collect::<Vec<_>>();
         let deleted = deleted_ids.len();
-        self.active_tab_mut()
+        self.active_view_mut()
             .workflow_ids
             .retain(|id| !deleted_ids.contains(id));
 
@@ -703,7 +898,7 @@ impl App {
         } else {
             Some(selected.min(visible_count - 1))
         };
-        self.active_tab_mut().table_state.select(next_selection);
+        self.active_view_mut().table_state.select(next_selection);
         self.message = Some(if deleted == 1 {
             "1 workflow deleted".to_owned()
         } else {
@@ -746,20 +941,34 @@ impl App {
             .enumerate()
             .filter(|(_, tab)| !tab.is_triage)
             .map(|(index, tab)| {
+                let persisted_views = tab
+                    .views
+                    .iter()
+                    .map(|view| ViewPane {
+                        workflow_ids: view.workflow_ids.clone(),
+                        filter: view.filter.clone(),
+                        sort: view.sort.clone(),
+                        selected_workflow_id: view
+                            .table_state
+                            .selected()
+                            .and_then(|selected| {
+                                self.visible_workflows_for(view).get(selected).copied()
+                            })
+                            .map(|workflow| workflow.id),
+                    })
+                    .collect::<Vec<_>>();
+                let primary = &persisted_views[0];
                 (
                     index,
                     ViewTab {
                         name: tab.name.clone(),
-                        workflow_ids: tab.workflow_ids.clone(),
-                        filter: tab.filter.clone(),
-                        sort: tab.sort.clone(),
-                        selected_workflow_id: tab
-                            .table_state
-                            .selected()
-                            .and_then(|selected| {
-                                self.visible_workflows_for(tab).get(selected).copied()
-                            })
-                            .map(|workflow| workflow.id),
+                        workflow_ids: primary.workflow_ids.clone(),
+                        filter: primary.filter.clone(),
+                        sort: primary.sort.clone(),
+                        selected_workflow_id: primary.selected_workflow_id,
+                        additional_views: persisted_views.into_iter().skip(1).collect(),
+                        layout: tab.layout.clone(),
+                        active_view: tab.active_view,
                     },
                 )
             })
@@ -772,6 +981,9 @@ impl App {
                     filter: None,
                     sort: None,
                     selected_workflow_id: self.workflows.first().map(|workflow| workflow.id),
+                    additional_views: Vec::new(),
+                    layout: ViewLayout::default(),
+                    active_view: 0,
                 }],
                 0,
             );
@@ -830,8 +1042,8 @@ impl App {
 
     fn set_filter(&mut self, argument: Option<&str>) {
         let Some(expression) = argument.filter(|argument| !argument.is_empty()) else {
-            self.active_tab_mut().filter = None;
-            self.active_tab_mut().filter_expression = None;
+            self.active_view_mut().filter = None;
+            self.active_view_mut().filter_expression = None;
             self.reset_visible_selection();
             self.message = Some("Filter cleared".to_owned());
             return;
@@ -839,8 +1051,8 @@ impl App {
 
         match FilterExpression::parse(expression) {
             Ok(filter) => {
-                self.active_tab_mut().filter = Some(expression.to_owned());
-                self.active_tab_mut().filter_expression = Some(filter);
+                self.active_view_mut().filter = Some(expression.to_owned());
+                self.active_view_mut().filter_expression = Some(filter);
                 self.reset_visible_selection();
                 self.message = Some(format!("Filter: {expression}"));
             }
@@ -850,8 +1062,8 @@ impl App {
 
     fn set_sort(&mut self, argument: Option<&str>) {
         let Some(specification) = argument.filter(|argument| !argument.is_empty()) else {
-            self.active_tab_mut().sort = None;
-            self.active_tab_mut().sort_spec = None;
+            self.active_view_mut().sort = None;
+            self.active_view_mut().sort_spec = None;
             self.reset_visible_selection();
             self.message = Some("Sort cleared".to_owned());
             return;
@@ -859,8 +1071,8 @@ impl App {
 
         match SortSpec::parse(specification) {
             Ok(sort) => {
-                self.active_tab_mut().sort = Some(specification.to_owned());
-                self.active_tab_mut().sort_spec = Some(sort);
+                self.active_view_mut().sort = Some(specification.to_owned());
+                self.active_view_mut().sort_spec = Some(sort);
                 self.reset_visible_selection();
                 self.message = Some(format!("Sort: {specification}"));
             }
@@ -870,9 +1082,39 @@ impl App {
 
     fn reset_visible_selection(&mut self) {
         let has_visible = !self.visible_workflows().is_empty();
-        self.active_tab_mut()
+        self.active_view_mut()
             .table_state
             .select(has_visible.then_some(0));
+    }
+
+    fn split_view(&mut self, argument: Option<&str>) {
+        if self.active_tab().is_triage {
+            self.message = Some("E474: Triage views cannot be split".to_owned());
+            return;
+        }
+        let direction = match argument {
+            Some("horizontal") => SplitDirection::Horizontal,
+            Some("vertical") => SplitDirection::Vertical,
+            Some(argument) => {
+                self.message = Some(format!("E474: Invalid split direction: {argument}"));
+                return;
+            }
+            None => {
+                self.message = Some("E471: Argument required".to_owned());
+                return;
+            }
+        };
+
+        let tab = self.active_tab_mut();
+        let source_index = tab.active_view;
+        let new_index = tab.views.len();
+        tab.views.push(tab.views[source_index].clone());
+        split_layout_leaf(&mut tab.layout, source_index, new_index, direction);
+        tab.active_view = new_index;
+        self.message = Some(match direction {
+            SplitDirection::Horizontal => "View split horizontally".to_owned(),
+            SplitDirection::Vertical => "View split vertically".to_owned(),
+        });
     }
 
     fn tab_new(&mut self, name: Option<&str>) {
@@ -1041,8 +1283,8 @@ impl App {
             return;
         }
 
-        let current = self.active_tab().table_state.selected().unwrap_or(0);
-        self.active_tab_mut()
+        let current = self.active_view().table_state.selected().unwrap_or(0);
+        self.active_view_mut()
             .table_state
             .select(Some((current + amount).min(visible_count - 1)));
     }
@@ -1052,22 +1294,22 @@ impl App {
             return;
         }
 
-        let current = self.active_tab().table_state.selected().unwrap_or(0);
-        self.active_tab_mut()
+        let current = self.active_view().table_state.selected().unwrap_or(0);
+        self.active_view_mut()
             .table_state
             .select(Some(current.saturating_sub(amount)));
     }
 
     fn select_first(&mut self) {
         if !self.visible_workflows().is_empty() {
-            self.active_tab_mut().table_state.select(Some(0));
+            self.active_view_mut().table_state.select(Some(0));
         }
     }
 
     fn select_last(&mut self) {
         let visible_count = self.visible_workflows().len();
         if visible_count > 0 {
-            self.active_tab_mut()
+            self.active_view_mut()
                 .table_state
                 .select(Some(visible_count - 1));
         }
@@ -1113,79 +1355,56 @@ impl App {
             frame.render_widget(tabs, tabs_area);
         }
 
-        let visible_workflows = self
-            .visible_workflows()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if visible_workflows.is_empty() {
-            let empty_message = if self.triage_receiver.is_some() {
-                "Triaging failing workflows..."
-            } else if self.active_tab().is_triage {
-                "No failing scheduled workflows were found."
-            } else if self.is_loading() {
-                "Loading GitHub Actions workflows..."
-            } else if self
-                .tabs
-                .get(self.active_tab)
-                .is_some_and(|tab| tab.filter.is_some())
-            {
-                "No workflows match the active filter."
+        self.pane_areas.clear();
+        if self.active_tab().is_triage {
+            let visible_workflows = self
+                .visible_workflows()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            self.pane_areas.push((0, table_area));
+            if visible_workflows.is_empty() {
+                let empty_message = if self.triage_receiver.is_some() {
+                    "Triaging failing workflows..."
+                } else {
+                    "No failing scheduled workflows were found."
+                };
+                let empty = Paragraph::new(empty_message).centered().block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {} ", self.repository)),
+                );
+                frame.render_widget(empty, table_area);
             } else {
-                "This repository has no active GitHub Actions workflows."
-            };
-            let empty = Paragraph::new(empty_message).centered().block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} ", self.repository)),
-            );
-            frame.render_widget(empty, table_area);
-        } else if self.active_tab().is_triage {
-            self.render_triage_blocks(frame, table_area, &visible_workflows);
+                self.render_triage_blocks(frame, table_area, &visible_workflows);
+            }
         } else {
-            let header = Row::new(["Status", "Name", "24 Hours", "7 Days", "14 Days"])
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .bottom_margin(1);
-            let flash_visible = flash_visible(self.animation_started.elapsed());
-            let rows = visible_workflows.iter().map(|workflow| {
-                Row::new([
-                    Cell::from(status_indicator(workflow, flash_visible)),
-                    Cell::from(workflow.name.as_str()),
-                    metrics_cell(workflow.run_metrics.last_24_hours),
-                    metrics_cell(workflow.run_metrics.last_7_days),
-                    metrics_cell(workflow.run_metrics.last_14_days),
-                ])
-            });
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(8),
-                    Constraint::Min(20),
-                    Constraint::Length(19),
-                    Constraint::Length(19),
-                    Constraint::Length(19),
-                ],
-            )
-            .header(header)
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ")
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " {} - {} active workflows ",
-                self.repository,
-                visible_workflows.len()
-            )));
-
+            let pane_areas = layout_areas(&self.active_tab().layout, table_area);
+            self.pane_areas.clone_from(&pane_areas);
             let active_tab = self.active_tab;
-            frame.render_stateful_widget(table, table_area, &mut self.tabs[active_tab].table_state);
+            for (view_index, area) in pane_areas {
+                let workflows = self
+                    .visible_workflows_for(&self.tabs[active_tab].views[view_index])
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let is_filtered = self.tabs[active_tab].views[view_index].filter.is_some();
+                let active = view_index == self.tabs[active_tab].active_view;
+                let repository = self.repository.clone();
+                let loading = self.is_loading();
+                let flash = flash_visible(self.animation_started.elapsed());
+                render_list_view(
+                    frame,
+                    area,
+                    &repository,
+                    &workflows,
+                    &mut self.tabs[active_tab].views[view_index].table_state,
+                    active,
+                    loading,
+                    is_filtered,
+                    flash,
+                );
+            }
         }
 
         match self.mode {
@@ -1218,7 +1437,7 @@ impl App {
     }
 
     fn render_triage_blocks(&self, frame: &mut Frame, area: Rect, visible_workflows: &[Workflow]) {
-        let selected = self.active_tab().table_state.selected().unwrap_or(0);
+        let selected = self.active_view().table_state.selected().unwrap_or(0);
         let mut y = area.y;
         let summary = triage_correlation_summary(visible_workflows, &self.triage);
         let summary_height = triage_block_height(&summary, area.width)
@@ -1261,6 +1480,142 @@ impl App {
             y = y.saturating_add(height);
         }
     }
+}
+
+fn split_layout_leaf(
+    layout: &mut ViewLayout,
+    target: usize,
+    new_index: usize,
+    direction: SplitDirection,
+) -> bool {
+    match layout {
+        ViewLayout::Pane { index } if *index == target => {
+            *layout = ViewLayout::Split {
+                direction,
+                first: Box::new(ViewLayout::Pane { index: target }),
+                second: Box::new(ViewLayout::Pane { index: new_index }),
+            };
+            true
+        }
+        ViewLayout::Pane { .. } => false,
+        ViewLayout::Split { first, second, .. } => {
+            split_layout_leaf(first, target, new_index, direction)
+                || split_layout_leaf(second, target, new_index, direction)
+        }
+    }
+}
+
+fn layout_areas(layout: &ViewLayout, area: Rect) -> Vec<(usize, Rect)> {
+    fn collect(layout: &ViewLayout, area: Rect, areas: &mut Vec<(usize, Rect)>) {
+        match layout {
+            ViewLayout::Pane { index } => areas.push((*index, area)),
+            ViewLayout::Split {
+                direction,
+                first,
+                second,
+            } => {
+                let [first_area, second_area] = match direction {
+                    SplitDirection::Horizontal => {
+                        Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                            .areas(area)
+                    }
+                    SplitDirection::Vertical => {
+                        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                            .areas(area)
+                    }
+                };
+                collect(first, first_area, areas);
+                collect(second, second_area, areas);
+            }
+        }
+    }
+
+    let mut areas = Vec::new();
+    collect(layout, area, &mut areas);
+    areas
+}
+
+fn rect_center(area: Rect) -> (u16, u16) {
+    (
+        area.x.saturating_add(area.width / 2),
+        area.y.saturating_add(area.height / 2),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_list_view(
+    frame: &mut Frame,
+    area: Rect,
+    repository: &Repository,
+    workflows: &[Workflow],
+    table_state: &mut TableState,
+    active: bool,
+    loading: bool,
+    is_filtered: bool,
+    flash_visible: bool,
+) {
+    let border_style = if active {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(format!(
+            " {repository} - {} active workflows ",
+            workflows.len()
+        ));
+
+    if workflows.is_empty() {
+        let message = if loading {
+            "Loading GitHub Actions workflows..."
+        } else if is_filtered {
+            "No workflows match this view's filter."
+        } else {
+            "This view has no active GitHub Actions workflows."
+        };
+        frame.render_widget(Paragraph::new(message).centered().block(block), area);
+        return;
+    }
+
+    let header = Row::new(["Status", "Name", "24 Hours", "7 Days", "14 Days"])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+    let rows = workflows.iter().map(|workflow| {
+        Row::new([
+            Cell::from(status_indicator(workflow, flash_visible)),
+            Cell::from(workflow.name.as_str()),
+            metrics_cell(workflow.run_metrics.last_24_hours),
+            metrics_cell(workflow.run_metrics.last_7_days),
+            metrics_cell(workflow.run_metrics.last_14_days),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(19),
+            Constraint::Length(19),
+            Constraint::Length(19),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(">> ")
+    .block(block);
+    frame.render_stateful_widget(table, area, table_state);
 }
 
 fn render_status_bar(
@@ -1501,6 +1856,10 @@ pub fn run(
 ) -> io::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::init();
+    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+        ratatui::restore();
+        return Err(error);
+    }
     let result = App::new_loading(
         repository,
         workflow_ids,
@@ -1510,6 +1869,7 @@ pub fn run(
         active_tab,
     )
     .run(&mut terminal);
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -1524,7 +1884,7 @@ fn install_panic_hook() {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 #[cfg(test)]
@@ -1622,6 +1982,89 @@ mod tests {
         app.triage_receiver = None;
         let target = app.triage_target.take();
         app.finish_triage(result, target);
+    }
+
+    #[test]
+    fn split_command_duplicates_active_view_with_requested_layout() {
+        let mut app = app(3);
+        enter_command(&mut app, "split vertical");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active_tab().views.len(), 2);
+        assert_eq!(app.active_tab().active_view, 1);
+        assert_eq!(app.active_view().workflow_ids, vec![0, 1, 2]);
+        assert_eq!(
+            app.active_tab().layout,
+            ViewLayout::Split {
+                direction: SplitDirection::Vertical,
+                first: Box::new(ViewLayout::Pane { index: 0 }),
+                second: Box::new(ViewLayout::Pane { index: 1 }),
+            }
+        );
+    }
+
+    #[test]
+    fn filters_and_sorts_apply_only_to_active_split() {
+        let mut app = app(3);
+        enter_command(&mut app, "split horizontal");
+        app.handle_key(key(KeyCode::Enter));
+        enter_command(&mut app, "filter name:\"Workflow 1\"");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.active_tab().views[0].filter.is_none());
+        assert_eq!(
+            app.active_tab().views[1].filter.as_deref(),
+            Some("name:\"Workflow 1\"")
+        );
+        assert_eq!(app.visible_workflows().len(), 1);
+
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 80, 20));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.active_tab().active_view, 0);
+        assert_eq!(app.visible_workflows().len(), 3);
+    }
+
+    #[test]
+    fn mouse_click_focuses_split_view() {
+        let mut app = app(2);
+        app.split_view(Some("vertical"));
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.active_tab().active_view, 0);
+    }
+
+    #[test]
+    fn persisted_tabs_include_split_layout_and_view_state() {
+        let mut app = app(3);
+        app.split_view(Some("vertical"));
+        app.active_view_mut().filter = Some("status:failure".to_owned());
+        app.active_view_mut().filter_expression =
+            Some(FilterExpression::parse("status:failure").unwrap());
+        app.active_view_mut().sort = Some("name:desc".to_owned());
+        app.active_view_mut().sort_spec = Some(SortSpec::parse("name:desc").unwrap());
+
+        let (tabs, active_tab) = app.persisted_tabs();
+
+        assert_eq!(active_tab, 0);
+        assert_eq!(tabs[0].additional_views.len(), 1);
+        assert_eq!(
+            tabs[0].additional_views[0].filter.as_deref(),
+            Some("status:failure")
+        );
+        assert_eq!(
+            tabs[0].additional_views[0].sort.as_deref(),
+            Some("name:desc")
+        );
+        assert_eq!(tabs[0].active_view, 1);
+        assert!(matches!(tabs[0].layout, ViewLayout::Split { .. }));
     }
 
     #[test]
