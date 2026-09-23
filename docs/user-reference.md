@@ -85,6 +85,17 @@ The tab shortcuts work in both Normal and Command modes.
 | Enter | Execute the command |
 | Escape | Cancel the command |
 
+Command history is shared across `gh-actui` sessions for the current user.
+Empty commands and consecutive duplicates are omitted, and the latest 1,000
+commands are retained. The history file is stored at:
+
+- `%LOCALAPPDATA%\gh-actui\history` on Windows
+- `$XDG_STATE_HOME/gh-actui/history` when `XDG_STATE_HOME` is set
+- `~/.local/state/gh-actui/history` otherwise
+
+Set `GH_ACTUI_HISTORY` to use a different history file. History is loaded at
+startup and updated after every executed command, including `:q`.
+
 ## Commands
 
 | Command | Action |

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    io,
-    path::PathBuf,
+    env, fs, io,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver, TryRecvError},
@@ -39,6 +39,7 @@ const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const SPLIT_RATIO_SCALE: u16 = 1000;
 const MIN_VIEW_HEIGHT: u16 = 5;
 const MIN_VIEW_WIDTH: u16 = 20;
+const MAX_COMMAND_HISTORY: usize = 1000;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -200,6 +201,7 @@ struct App {
     command: String,
     command_cursor: usize,
     command_history: Vec<String>,
+    command_history_path: Option<PathBuf>,
     history_index: Option<usize>,
     history_draft: String,
     message: Option<String>,
@@ -254,6 +256,7 @@ impl App {
             command: String::new(),
             command_cursor: 0,
             command_history: Vec::new(),
+            command_history_path: None,
             history_index: None,
             history_draft: String::new(),
             message: None,
@@ -841,7 +844,7 @@ impl App {
     fn execute_command(&mut self) {
         let command = self.command.trim().to_owned();
         if !command.is_empty() {
-            self.command_history.push(command.clone());
+            self.record_command(command.clone());
         }
 
         if let Some(count) = parse_delete_command(&command) {
@@ -890,6 +893,24 @@ impl App {
         }
 
         self.finish_command();
+    }
+
+    fn record_command(&mut self, command: String) {
+        if self.command_history.last() != Some(&command) {
+            self.command_history.push(command);
+        }
+        let excess = self
+            .command_history
+            .len()
+            .saturating_sub(MAX_COMMAND_HISTORY);
+        if excess > 0 {
+            self.command_history.drain(..excess);
+        }
+        if let Some(path) = self.command_history_path.as_ref()
+            && let Err(error) = save_command_history(path, &self.command_history)
+        {
+            self.message = Some(format!("E886: Could not save command history: {error}"));
+        }
     }
 
     fn finish_command(&mut self) {
@@ -2219,6 +2240,62 @@ fn char_to_byte_index(value: &str, character_index: usize) -> usize {
         .map_or(value.len(), |(index, _)| index)
 }
 
+fn command_history_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("GH_ACTUI_HISTORY").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    if cfg!(windows) {
+        return env::var_os("LOCALAPPDATA")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .map(|path| path.join("gh-actui").join("history"));
+    }
+    env::var_os("XDG_STATE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join("gh-actui").join("history"))
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .map(|path| {
+                    path.join(".local")
+                        .join("state")
+                        .join("gh-actui")
+                        .join("history")
+                })
+        })
+}
+
+fn load_command_history(path: &Path) -> io::Result<Vec<String>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut history = contents
+        .lines()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if history.len() > MAX_COMMAND_HISTORY {
+        history.drain(..history.len() - MAX_COMMAND_HISTORY);
+    }
+    Ok(history)
+}
+
+fn save_command_history(path: &Path, history: &[String]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut contents = history.join("\n");
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    fs::write(path, contents)
+}
+
 pub fn run(
     repository: Repository,
     workflow_ids: Option<Vec<u64>>,
@@ -2233,15 +2310,26 @@ pub fn run(
         ratatui::restore();
         return Err(error);
     }
-    let result = App::new_loading(
+    let mut app = App::new_loading(
         repository,
         workflow_ids,
         state_path,
         workflow_source,
         tabs,
         active_tab,
-    )
-    .run(&mut terminal);
+    );
+    if let Some(path) = command_history_path() {
+        match load_command_history(&path) {
+            Ok(history) => app.command_history = history,
+            Err(error) => {
+                app.message = Some(format!("E886: Could not load command history: {error}"));
+            }
+        }
+        app.command_history_path = Some(path);
+    } else {
+        app.message = Some("E886: Could not determine command history path".to_owned());
+    }
+    let result = app.run(&mut terminal);
     let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -2830,6 +2918,55 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.command_history.is_empty());
+    }
+
+    #[test]
+    fn command_history_persists_and_suppresses_consecutive_duplicates() {
+        let path = env::temp_dir().join(format!(
+            "gh-actui-command-history-{}.txt",
+            std::process::id()
+        ));
+        let mut app = app(1);
+        app.command_history_path = Some(path.clone());
+
+        for command in [
+            "filter status:failure",
+            "filter status:failure",
+            "sort name",
+        ] {
+            enter_command(&mut app, command);
+            app.handle_key(key(KeyCode::Enter));
+        }
+
+        assert_eq!(app.command_history, ["filter status:failure", "sort name"]);
+        assert_eq!(
+            load_command_history(&path).unwrap(),
+            ["filter status:failure", "sort name"]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn command_history_load_retains_latest_entries() {
+        let path = env::temp_dir().join(format!(
+            "gh-actui-command-history-limit-{}.txt",
+            std::process::id()
+        ));
+        let contents = (0..MAX_COMMAND_HISTORY + 2)
+            .map(|index| format!("command-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, contents).unwrap();
+
+        let history = load_command_history(&path).unwrap();
+
+        assert_eq!(history.len(), MAX_COMMAND_HISTORY);
+        assert_eq!(history.first().unwrap(), "command-2");
+        assert_eq!(
+            history.last().unwrap(),
+            &format!("command-{}", MAX_COMMAND_HISTORY + 1)
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
