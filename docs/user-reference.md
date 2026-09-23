@@ -23,6 +23,10 @@ the visible area.
 The status indicator flashes every half second while the workflow has a run in
 progress.
 
+Workflow and run data load in the background. While loading, the bottom bar
+replaces the normal keybinding summary with a loading status. The interface
+remains responsive, including while `:e` refreshes a saved view.
+
 ## Keyboard shortcuts
 
 The interface starts in Normal mode. Press `:` to enter Command mode. Command

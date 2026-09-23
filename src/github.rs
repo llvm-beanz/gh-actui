@@ -55,7 +55,7 @@ pub enum Error {
     StatusWorker,
 }
 
-pub trait WorkflowSource {
+pub trait WorkflowSource: Send + Sync {
     fn list_workflows(&self, repository: &Repository) -> Result<Vec<Workflow>, Error>;
 }
 

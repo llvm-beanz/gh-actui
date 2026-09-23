@@ -1,5 +1,13 @@
-use std::time::{Duration, Instant};
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::PathBuf,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -29,11 +37,19 @@ enum Mode {
     Command,
 }
 
-struct App<'a> {
+struct PendingLoad {
+    repository: Repository,
+    workflow_ids: Option<Vec<u64>>,
+    state_path: Option<PathBuf>,
+}
+
+struct App {
     repository: Repository,
     workflows: Vec<Workflow>,
     state_path: Option<PathBuf>,
-    workflow_source: &'a dyn WorkflowSource,
+    workflow_source: Arc<dyn WorkflowSource>,
+    load_receiver: Option<Receiver<Result<Vec<Workflow>, crate::github::Error>>>,
+    pending_load: Option<PendingLoad>,
     table_state: TableState,
     mode: Mode,
     command: String,
@@ -47,12 +63,12 @@ struct App<'a> {
     animation_started: Instant,
 }
 
-impl<'a> App<'a> {
+impl App {
     fn new(
         repository: Repository,
         workflows: Vec<Workflow>,
         state_path: Option<PathBuf>,
-        workflow_source: &'a dyn WorkflowSource,
+        workflow_source: Arc<dyn WorkflowSource>,
     ) -> Self {
         let selected = (!workflows.is_empty()).then_some(0);
         Self {
@@ -60,6 +76,8 @@ impl<'a> App<'a> {
             workflows,
             state_path,
             workflow_source,
+            load_receiver: None,
+            pending_load: None,
             table_state: TableState::default().with_selected(selected),
             mode: Mode::Normal,
             command: String::new(),
@@ -74,8 +92,24 @@ impl<'a> App<'a> {
         }
     }
 
+    fn new_loading(
+        repository: Repository,
+        workflow_ids: Option<Vec<u64>>,
+        state_path: Option<PathBuf>,
+        workflow_source: Arc<dyn WorkflowSource>,
+    ) -> Self {
+        let mut app = Self::new(repository.clone(), Vec::new(), None, workflow_source);
+        app.start_loading(PendingLoad {
+            repository,
+            workflow_ids,
+            state_path,
+        });
+        app
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.should_quit {
+            self.poll_loading();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(EVENT_POLL_INTERVAL)?
@@ -87,6 +121,80 @@ impl<'a> App<'a> {
         }
 
         Ok(())
+    }
+
+    fn start_loading(&mut self, pending: PendingLoad) {
+        let source = Arc::clone(&self.workflow_source);
+        let repository = pending.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.list_workflows(&repository));
+        });
+        self.load_receiver = Some(receiver);
+        self.pending_load = Some(pending);
+        self.message = None;
+    }
+
+    fn poll_loading(&mut self) {
+        let Some(receiver) = self.load_receiver.as_ref() else {
+            return;
+        };
+
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.finish_loading(Err("workflow loading stopped unexpectedly".to_owned()));
+                return;
+            }
+        };
+        self.finish_loading(result.map_err(|error| error.to_string()));
+    }
+
+    fn finish_loading(&mut self, result: Result<Vec<Workflow>, String>) {
+        self.load_receiver = None;
+        let Some(pending) = self.pending_load.take() else {
+            return;
+        };
+
+        match result {
+            Ok(workflows) => {
+                self.repository = pending.repository;
+                self.workflows = match pending.workflow_ids {
+                    Some(workflow_ids) => ViewState::resolve_workflows(&workflow_ids, workflows),
+                    None => workflows,
+                };
+                self.state_path = pending.state_path;
+                self.table_state =
+                    TableState::default().with_selected((!self.workflows.is_empty()).then_some(0));
+                self.message = Some(format!("{} workflows loaded", self.workflows.len()));
+            }
+            Err(error) => self.message = Some(format!("E484: {error}")),
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        self.pending_load.is_some()
+    }
+
+    fn normal_status(&self) -> (&'static str, String) {
+        if let Some(pending) = self.pending_load.as_ref() {
+            (
+                " LOADING ",
+                format!(
+                    "Loading workflows and run status for {}...",
+                    pending.repository
+                ),
+            )
+        } else {
+            (
+                " NORMAL ",
+                self.message
+                    .as_deref()
+                    .unwrap_or("j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  gg/G: jump  |  :q: quit")
+                    .to_owned(),
+            )
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -271,28 +379,12 @@ impl<'a> App<'a> {
             }
         };
 
-        let loaded = ViewState::load(&path).and_then(|state| {
-            let workflows = self
-                .workflow_source
-                .list_workflows(&state.repository)
-                .map_err(crate::state::Error::Refresh)?;
-            let workflows = state.resolve_workflows(workflows);
-            Ok((state.repository, workflows))
-        });
-
-        match loaded {
-            Ok((repository, workflows)) => {
-                self.repository = repository;
-                self.workflows = workflows;
-                self.table_state =
-                    TableState::default().with_selected((!self.workflows.is_empty()).then_some(0));
-                self.message = Some(format!(
-                    "\"{}\" {} workflows loaded",
-                    path.display(),
-                    self.workflows.len()
-                ));
-                self.state_path = Some(path);
-            }
+        match ViewState::load(&path) {
+            Ok(state) => self.start_loading(PendingLoad {
+                repository: state.repository,
+                workflow_ids: Some(state.workflow_ids),
+                state_path: Some(path),
+            }),
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
     }
@@ -390,13 +482,16 @@ impl<'a> App<'a> {
             Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
 
         if self.workflows.is_empty() {
-            let empty = Paragraph::new("This repository has no active GitHub Actions workflows.")
-                .centered()
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {} ", self.repository)),
-                );
+            let empty_message = if self.is_loading() {
+                "Loading GitHub Actions workflows..."
+            } else {
+                "This repository has no active GitHub Actions workflows."
+            };
+            let empty = Paragraph::new(empty_message).centered().block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", self.repository)),
+            );
             frame.render_widget(empty, table_area);
         } else {
             let header = Row::new(["Status", "Name"])
@@ -433,13 +528,10 @@ impl<'a> App<'a> {
 
         match self.mode {
             Mode::Normal => {
-                let text = self
-                    .message
-                    .as_deref()
-                    .unwrap_or("j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  gg/G: jump  |  :q: quit");
+                let (title, text) = self.normal_status();
                 let help = Paragraph::new(text)
                     .dark_gray()
-                    .block(Block::default().borders(Borders::ALL).title(" NORMAL "));
+                    .block(Block::default().borders(Borders::ALL).title(title));
                 frame.render_widget(help, help_area);
             }
             Mode::Command => {
@@ -513,13 +605,14 @@ fn char_to_byte_index(value: &str, character_index: usize) -> usize {
 
 pub fn run(
     repository: Repository,
-    workflows: Vec<Workflow>,
+    workflow_ids: Option<Vec<u64>>,
     state_path: Option<PathBuf>,
-    workflow_source: &dyn WorkflowSource,
+    workflow_source: Arc<dyn WorkflowSource>,
 ) -> io::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::init();
-    let result = App::new(repository, workflows, state_path, workflow_source).run(&mut terminal);
+    let result =
+        App::new_loading(repository, workflow_ids, state_path, workflow_source).run(&mut terminal);
     ratatui::restore();
     result
 }
@@ -542,8 +635,6 @@ mod tests {
     use super::*;
 
     struct TestWorkflowSource;
-
-    static TEST_WORKFLOW_SOURCE: TestWorkflowSource = TestWorkflowSource;
 
     impl WorkflowSource for TestWorkflowSource {
         fn list_workflows(
@@ -572,10 +663,10 @@ mod tests {
         }
     }
 
-    fn app(workflow_count: u64) -> App<'static> {
+    fn app(workflow_count: u64) -> App {
         let repository = "owner/repository".parse().unwrap();
         let workflows = (0..workflow_count).map(workflow).collect();
-        App::new(repository, workflows, None, &TEST_WORKFLOW_SOURCE)
+        App::new(repository, workflows, None, Arc::new(TestWorkflowSource))
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -589,6 +680,17 @@ mod tests {
         }
     }
 
+    fn complete_loading(app: &mut App) {
+        let result = app
+            .load_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .map_err(|error| error.to_string());
+        app.finish_loading(result);
+    }
+
     #[test]
     fn new_selects_first_workflow() {
         assert_eq!(app(2).table_state.selected(), Some(0));
@@ -597,6 +699,48 @@ mod tests {
     #[test]
     fn new_leaves_selection_empty_without_workflows() {
         assert_eq!(app(0).table_state.selected(), None);
+    }
+
+    #[test]
+    fn new_loading_returns_before_workflows_are_available() {
+        let mut app = App::new_loading(
+            "owner/repository".parse().unwrap(),
+            None,
+            None,
+            Arc::new(TestWorkflowSource),
+        );
+
+        assert!(app.is_loading());
+        assert!(app.workflows.is_empty());
+        assert_eq!(
+            app.normal_status(),
+            (
+                " LOADING ",
+                "Loading workflows and run status for owner/repository...".to_owned()
+            )
+        );
+
+        complete_loading(&mut app);
+
+        assert!(!app.is_loading());
+        assert_eq!(app.workflows.len(), 100);
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn loading_saved_view_filters_current_data_in_saved_order() {
+        let mut app = App::new_loading(
+            "owner/repository".parse().unwrap(),
+            Some(vec![3, 1]),
+            Some(PathBuf::from("saved-view.json")),
+            Arc::new(TestWorkflowSource),
+        );
+
+        complete_loading(&mut app);
+
+        let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
+        assert_eq!(ids, vec![3, 1]);
+        assert_eq!(app.state_path, Some(PathBuf::from("saved-view.json")));
     }
 
     #[test]
@@ -743,6 +887,8 @@ mod tests {
         app.workflows.clear();
         enter_command(&mut app, "e");
         app.handle_key(key(KeyCode::Enter));
+        assert!(app.is_loading());
+        complete_loading(&mut app);
         std::fs::remove_file(path).unwrap();
 
         assert_eq!(app.workflows.len(), 2);

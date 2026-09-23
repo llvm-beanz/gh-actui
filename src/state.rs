@@ -54,8 +54,6 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("could not refresh saved workflows: {0}")]
-    Refresh(#[from] crate::github::Error),
 }
 
 impl ViewState {
@@ -65,17 +63,6 @@ impl ViewState {
             repository,
             workflow_ids: workflows.iter().map(|workflow| workflow.id).collect(),
         }
-    }
-
-    pub fn resolve_workflows(&self, workflows: Vec<Workflow>) -> Vec<Workflow> {
-        let mut workflows_by_id: HashMap<_, _> = workflows
-            .into_iter()
-            .map(|workflow| (workflow.id, workflow))
-            .collect();
-        self.workflow_ids
-            .iter()
-            .filter_map(|id| workflows_by_id.remove(id))
-            .collect()
     }
 
     pub fn load(path: &Path) -> Result<Self, Error> {
@@ -107,6 +94,17 @@ impl ViewState {
             repository: stored.repository,
             workflow_ids,
         })
+    }
+
+    pub fn resolve_workflows(workflow_ids: &[u64], workflows: Vec<Workflow>) -> Vec<Workflow> {
+        let mut workflows_by_id: HashMap<_, _> = workflows
+            .into_iter()
+            .map(|workflow| (workflow.id, workflow))
+            .collect();
+        workflow_ids
+            .iter()
+            .filter_map(|id| workflows_by_id.remove(id))
+            .collect()
     }
 
     pub fn save(&self, path: &Path) -> Result<(), Error> {
@@ -189,7 +187,7 @@ mod tests {
             },
         ];
 
-        let resolved = saved.resolve_workflows(workflows);
+        let resolved = ViewState::resolve_workflows(&saved.workflow_ids, workflows);
 
         assert_eq!(resolved[0].name, "Current Build");
         assert_eq!(resolved[1].name, "Current Test");

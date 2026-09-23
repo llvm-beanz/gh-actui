@@ -3,7 +3,7 @@ mod repository;
 mod state;
 mod tui;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
 use github::{GhWorkflowSource, WorkflowSource};
@@ -23,8 +23,6 @@ struct Cli {
 #[derive(Debug, Error)]
 enum Error {
     #[error(transparent)]
-    Github(#[from] github::Error),
-    #[error(transparent)]
     Tui(#[from] std::io::Error),
     #[error(transparent)]
     State(#[from] state::Error),
@@ -33,7 +31,7 @@ enum Error {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse(), &GhWorkflowSource) {
+    match run(Cli::parse(), Arc::new(GhWorkflowSource)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -42,18 +40,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli, source: &impl WorkflowSource) -> Result<(), Error> {
+fn run(cli: Cli, source: Arc<dyn WorkflowSource>) -> Result<(), Error> {
     let state_path = PathBuf::from(&cli.target);
-    let (repository, workflows, state_path) = if state_path.is_file() {
+    let (repository, workflow_ids, state_path) = if state_path.is_file() {
         let state = ViewState::load(&state_path)?;
-        let workflows = source.list_workflows(&state.repository)?;
-        let workflows = state.resolve_workflows(workflows);
-        (state.repository, workflows, Some(state_path))
+        (state.repository, Some(state.workflow_ids), Some(state_path))
     } else {
         let repository = cli.target.parse()?;
-        let workflows = source.list_workflows(&repository)?;
-        (repository, workflows, None)
+        (repository, None, None)
     };
-    tui::run(repository, workflows, state_path, source)?;
+    tui::run(repository, workflow_ids, state_path, source)?;
     Ok(())
 }
