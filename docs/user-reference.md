@@ -44,7 +44,10 @@ the latest completed run.
 Workflow and run data load in the background and refresh every 15 seconds by
 default. The bottom bar always displays the configured refresh rate. While
 loading or refreshing, it replaces the normal keybinding summary with the
-current operation. The interface remains responsive during background work.
+current operation. The borderless bar occupies one terminal row. Messages and
+command input stay anchored at the left edge, while the refresh rate and the
+highlighted current mode or operation stay anchored at the right edge. The
+interface remains responsive during background work.
 
 ## Keyboard shortcuts
 

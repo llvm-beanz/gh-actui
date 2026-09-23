@@ -19,7 +19,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 
@@ -497,10 +497,7 @@ impl App {
         if self.triage_receiver.is_some() {
             (
                 " TRIAGING ",
-                format!(
-                    "Analyzing scheduled failures, jobs, steps, and logs...  |  {}",
-                    self.refresh_rate_label()
-                ),
+                "Analyzing scheduled failures, jobs, steps, and logs...".to_owned(),
             )
         } else if let Some(pending) = self.pending_load.as_ref() {
             let action = match pending.kind {
@@ -514,9 +511,8 @@ impl App {
                     " LOADING "
                 },
                 format!(
-                    "{action} workflows and run status for {}...  |  {}",
-                    pending.repository,
-                    self.refresh_rate_label()
+                    "{action} workflows and run status for {}...",
+                    pending.repository
                 ),
             )
         } else {
@@ -527,9 +523,7 @@ impl App {
                     .unwrap_or(
                         "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit",
                     )
-                    .to_owned()
-                    + "  |  "
-                    + &self.refresh_rate_label(),
+                    .to_owned(),
             )
         }
     }
@@ -1082,13 +1076,13 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let (tabs_area, table_area, help_area) = if self.tabs.is_empty() {
             let [table_area, help_area] =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
+                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
             (None, table_area, help_area)
         } else {
             let [tabs_area, table_area, help_area] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Min(3),
-                Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .areas(frame.area());
             (Some(tabs_area), table_area, help_area)
@@ -1197,25 +1191,28 @@ impl App {
         match self.mode {
             Mode::Normal => {
                 let (title, text) = self.normal_status();
-                let help = Paragraph::new(text)
-                    .dark_gray()
-                    .block(Block::default().borders(Borders::ALL).title(title));
-                frame.render_widget(help, help_area);
+                render_status_bar(frame, help_area, &text, &self.refresh_rate_label(), title);
             }
             Mode::Command => {
-                let command = Paragraph::new(format!(":{}", self.command)).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" COMMAND | {} ", self.refresh_rate_label())),
+                const COMMAND_PREFIX: &str = ":";
+                let left_area = render_status_bar(
+                    frame,
+                    help_area,
+                    &format!("{COMMAND_PREFIX}{}", self.command),
+                    &self.refresh_rate_label(),
+                    " COMMAND ",
                 );
-                frame.render_widget(command, help_area);
 
-                let cursor_x = help_area
-                    .x
-                    .saturating_add(2)
-                    .saturating_add(self.command_cursor as u16)
-                    .min(help_area.right().saturating_sub(2));
-                frame.set_cursor_position((cursor_x, help_area.y.saturating_add(1)));
+                let cursor_x = if left_area.width == 0 {
+                    help_area.x
+                } else {
+                    left_area
+                        .x
+                        .saturating_add(COMMAND_PREFIX.chars().count() as u16)
+                        .saturating_add(self.command_cursor as u16)
+                        .min(left_area.right().saturating_sub(1))
+                };
+                frame.set_cursor_position((cursor_x, help_area.y));
             }
         }
     }
@@ -1264,6 +1261,40 @@ impl App {
             y = y.saturating_add(height);
         }
     }
+}
+
+fn render_status_bar(
+    frame: &mut Frame,
+    area: Rect,
+    text: &str,
+    refresh_rate: &str,
+    status: &str,
+) -> Rect {
+    let bar_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+    frame.render_widget(Block::default().style(bar_style), area);
+
+    let suffix_width = (refresh_rate.chars().count() + status.chars().count() + 2)
+        .min(usize::from(area.width)) as u16;
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(suffix_width)]).areas(area);
+
+    frame.render_widget(Paragraph::new(text.to_owned()).style(bar_style), left_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(format!("{refresh_rate}  ")),
+            Span::styled(
+                status.to_owned(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(bar_style),
+        right_area,
+    );
+
+    left_area
 }
 
 #[derive(Clone, Copy)]
@@ -1620,8 +1651,7 @@ mod tests {
             app.normal_status(),
             (
                 " LOADING ",
-                "Loading workflows and run status for owner/repository...  |  refresh: 15s"
-                    .to_owned()
+                "Loading workflows and run status for owner/repository...".to_owned()
             )
         );
 
@@ -1724,7 +1754,7 @@ mod tests {
             app.message.as_deref(),
             Some("Refresh rate set to 30 seconds")
         );
-        assert!(app.normal_status().1.ends_with("refresh: 30s"));
+        assert_eq!(app.refresh_rate_label(), "refresh: 30s");
     }
 
     #[test]
