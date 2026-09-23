@@ -48,6 +48,6 @@ gh extension install llvm-beanz/gh-actui
 ```
 
 Pushing a tag matching `v*` runs the release workflow, which builds Linux
-amd64, Windows amd64, and macOS amd64/arm64 executables and publishes them with
+amd64/arm64, Windows amd64/arm64, and macOS amd64/arm64 executables and publishes them with
 [`cli/gh-extension-precompile`](https://github.com/cli/gh-extension-precompile).
 Tags containing a hyphen, such as `v0.2.0-rc.1`, produce prereleases.
