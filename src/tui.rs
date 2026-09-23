@@ -1272,8 +1272,8 @@ impl App {
     }
 
     fn start_triage(&mut self) {
-        if self.is_loading() || self.triage_receiver.is_some() {
-            self.message = Some("Triage or refresh already in progress".to_owned());
+        if self.triage_receiver.is_some() {
+            self.message = Some("Triage already in progress".to_owned());
             return;
         }
         let workflows = self
@@ -1300,8 +1300,8 @@ impl App {
     }
 
     fn refresh_triage(&mut self) {
-        if self.is_loading() || self.triage_receiver.is_some() {
-            self.message = Some("Triage or refresh already in progress".to_owned());
+        if self.triage_receiver.is_some() {
+            self.message = Some("Triage already in progress".to_owned());
             return;
         }
         let workflows = self
@@ -3175,6 +3175,25 @@ mod tests {
             app.message.as_deref(),
             Some("2 failing scheduled workflows triaged")
         );
+    }
+
+    #[test]
+    fn triage_can_run_while_workflow_refresh_is_in_progress() {
+        let mut app = app(2);
+        app.workflows[0].run_status = RunStatus::Failure;
+        app.refresh_workflows();
+        assert!(app.is_loading());
+
+        app.start_triage();
+
+        assert!(app.is_loading());
+        assert!(app.triage_receiver.is_some());
+        complete_loading(&mut app);
+        complete_triage(&mut app);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.active_tab().is_triage);
+        assert_eq!(app.active_tab().workflow_ids, vec![0]);
     }
 
     #[test]

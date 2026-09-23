@@ -160,6 +160,9 @@ setting every nested split to 50/50. It does not change the split arrangement.
 
 `:triage` starts a background analysis of only the visible workflows whose
 latest completed run status is failing. It does not change the source tab.
+It can start while a workflow refresh is already running; in that case it
+uses the currently displayed failing-workflow snapshot while the refresh
+continues independently.
 For each candidate, `gh-actui` first fetches its workflow YAML and excludes
 workflows without a top-level `on.schedule` trigger. This prevents
 non-scheduled workflows with large histories from forcing a scan of their
