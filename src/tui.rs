@@ -168,6 +168,15 @@ impl<'a> App<'a> {
             self.command_history.push(command.clone());
         }
 
+        if let Some(count) = parse_delete_command(&command) {
+            match count {
+                Ok(count) => self.delete_rows(count),
+                Err(message) => self.message = Some(message),
+            }
+            self.finish_command();
+            return;
+        }
+
         let (name, argument) = command
             .split_once(char::is_whitespace)
             .map_or((command.as_str(), None), |(name, argument)| {
@@ -184,11 +193,38 @@ impl<'a> App<'a> {
             _ => self.message = Some(format!("E492: Not an editor command: {command}")),
         }
 
+        self.finish_command();
+    }
+
+    fn finish_command(&mut self) {
         self.command.clear();
         self.command_cursor = 0;
         self.history_index = None;
         self.history_draft.clear();
         self.mode = Mode::Normal;
+    }
+
+    fn delete_rows(&mut self, count: usize) {
+        let Some(selected) = self.table_state.selected() else {
+            self.message = Some("E749: Empty buffer".to_owned());
+            return;
+        };
+
+        let end = selected.saturating_add(count).min(self.workflows.len());
+        let deleted = end - selected;
+        self.workflows.drain(selected..end);
+
+        let next_selection = if self.workflows.is_empty() {
+            None
+        } else {
+            Some(selected.min(self.workflows.len() - 1))
+        };
+        self.table_state.select(next_selection);
+        self.message = Some(if deleted == 1 {
+            "1 workflow deleted".to_owned()
+        } else {
+            format!("{deleted} workflows deleted")
+        });
     }
 
     fn write_state(&mut self, argument: Option<&str>) {
@@ -417,6 +453,27 @@ fn command_path(argument: Option<&str>, remembered: Option<&PathBuf>) -> Result<
             .cloned()
             .ok_or_else(|| "E32: No file name".to_owned()),
     }
+}
+
+fn parse_delete_command(command: &str) -> Option<Result<usize, String>> {
+    let count = command.strip_prefix('d')?;
+    if count.is_empty() {
+        return Some(Ok(1));
+    }
+    if !count.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(
+        count
+            .parse::<usize>()
+            .map_err(|_| format!("E488: Trailing characters: {count}"))
+            .and_then(|count| {
+                (count > 0)
+                    .then_some(count)
+                    .ok_or_else(|| "E16: Invalid range".to_owned())
+            }),
+    )
 }
 
 fn status_indicator(workflow: &Workflow, flash_visible: bool) -> &'static str {
@@ -691,6 +748,66 @@ mod tests {
 
         assert_eq!(app.message.as_deref(), Some("E32: No file name"));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn delete_command_removes_selected_workflow() {
+        let mut app = app(3);
+        app.select_next(1);
+
+        enter_command(&mut app, "d");
+        app.handle_key(key(KeyCode::Enter));
+
+        let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
+        assert_eq!(ids, vec![0, 2]);
+        assert_eq!(app.table_state.selected(), Some(1));
+        assert_eq!(app.message.as_deref(), Some("1 workflow deleted"));
+    }
+
+    #[test]
+    fn delete_count_removes_consecutive_workflows_and_clamps_at_end() {
+        let mut app = app(5);
+        app.select_next(3);
+
+        enter_command(&mut app, "d3");
+        app.handle_key(key(KeyCode::Enter));
+
+        let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(app.table_state.selected(), Some(2));
+        assert_eq!(app.message.as_deref(), Some("2 workflows deleted"));
+    }
+
+    #[test]
+    fn delete_count_can_empty_view_and_clear_selection() {
+        let mut app = app(2);
+
+        enter_command(&mut app, "d2");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.workflows.is_empty());
+        assert_eq!(app.table_state.selected(), None);
+    }
+
+    #[test]
+    fn delete_zero_reports_invalid_range() {
+        let mut app = app(2);
+
+        enter_command(&mut app, "d0");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.workflows.len(), 2);
+        assert_eq!(app.message.as_deref(), Some("E16: Invalid range"));
+    }
+
+    #[test]
+    fn delete_from_empty_view_reports_error() {
+        let mut app = app(0);
+
+        enter_command(&mut app, "d");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.message.as_deref(), Some("E749: Empty buffer"));
     }
 
     #[test]

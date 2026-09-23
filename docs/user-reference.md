@@ -57,8 +57,14 @@ to execute a command or Escape to return to Normal mode.
 | `:q` | Exit |
 | `:w [path]` | Save the repository and displayed workflows as JSON |
 | `:e [path]` | Load a saved view and refresh its workflows from GitHub |
+| `:d` | Delete the selected workflow from the view |
+| `:dN` | Delete `N` consecutive workflows starting at the selection |
 
 There is no single-key quit binding in Normal mode.
+
+Deletion affects only the current view. Use `:w` to persist the updated
+workflow list. If the requested count extends past the end of the table, all
+remaining rows are deleted.
 
 After `:w path` or `:e path` succeeds, that path is remembered. Later `:w` or
 `:e` commands without a path reuse it. A state file supplied on the command
