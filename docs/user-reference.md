@@ -66,6 +66,9 @@ to execute a command or Escape to return to Normal mode.
 | `Ctrl+Tab` | Switch to the next tab |
 | `Ctrl+Shift+Tab` | Switch to the previous tab |
 | `Ctrl-w`, then an arrow or `h`/`j`/`k`/`l` | Focus the split view in that direction |
+| `Ctrl-w`, then `+` or `-` | Increase or decrease active view height by one row |
+| `Ctrl-w`, then `>` or `<` | Increase or decrease active view width by one column |
+| `Ctrl-w`, then `=` | Equalize all splits in the active tab |
 | Left mouse click | Focus the split view under the pointer |
 | `:` | Enter Command mode |
 
@@ -98,6 +101,11 @@ The tab shortcuts work in both Normal and Command modes.
 | `:sort` | Clear the active sort |
 | `:split horizontal` | Duplicate the active list view in a top/bottom split |
 | `:split vertical` | Duplicate the active list view in a side-by-side split |
+| `:resize height N` | Set the active view's approximate height to `N` rows |
+| `:resize height +N` or `-N` | Increase or decrease the active view's height |
+| `:resize width N` | Set the active view's approximate width to `N` columns |
+| `:resize width +N` or `-N` | Increase or decrease the active view's width |
+| `:resize equal` | Equalize all splits in the active tab |
 | `:tabnew [name]` | Duplicate the active workflow view in an optionally named tab |
 | `:tabsetname NAME` | Change the active tab's displayed name |
 | `:tabnext` or `:tabn` | Switch to the next tab |
@@ -137,6 +145,16 @@ dim borders. Use `Ctrl-w` followed by an arrow key or `h`, `j`, `k`, or `l` to
 move focus geometrically, or click a view with the left mouse button. Commands
 such as `:filter`, `:sort`, `:d`, and `:triage` operate on the active view.
 Triage result tabs cannot be split.
+
+Resizing changes the nearest split ancestor with the requested orientation:
+height changes use horizontal splits and width changes use vertical splits.
+Each side is kept at a minimum of 5 rows for horizontal splits or 20 columns
+for vertical splits. If the active view has no matching split, the command
+reports that it cannot be resized in that dimension. Split sizes are saved as
+relative weights, so their proportions survive terminal resizing and saved
+session reloads. `:resize equal` sizes the split subtrees according to how many
+views they contain, making the final views equal in size rather than merely
+setting every nested split to 50/50. It does not change the split arrangement.
 
 ### Failure triage
 

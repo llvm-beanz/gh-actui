@@ -30,12 +30,15 @@ use crate::{
     github::{RunCounts, RunStatus, Workflow, WorkflowSource, WorkflowTriage},
     query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
-    state::{SplitDirection, ViewLayout, ViewPane, ViewState, ViewTab},
+    state::{EQUAL_SPLIT_RATIO, SplitDirection, ViewLayout, ViewPane, ViewState, ViewTab},
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_FLASH_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const SPLIT_RATIO_SCALE: u16 = 1000;
+const MIN_VIEW_HEIGHT: u16 = 5;
+const MIN_VIEW_WIDTH: u16 = 20;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -50,6 +53,18 @@ enum FocusDirection {
     Right,
     Up,
     Down,
+}
+
+#[derive(Clone, Copy)]
+enum ResizeAxis {
+    Height,
+    Width,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResizeAmount {
+    Absolute(u16),
+    Delta(i16),
 }
 
 struct PendingLoad {
@@ -673,15 +688,25 @@ impl App {
 
         if self.pending_ctrl_w {
             self.pending_ctrl_w = false;
-            let direction = match key.code {
-                KeyCode::Left | KeyCode::Char('h') => Some(FocusDirection::Left),
-                KeyCode::Down | KeyCode::Char('j') => Some(FocusDirection::Down),
-                KeyCode::Up | KeyCode::Char('k') => Some(FocusDirection::Up),
-                KeyCode::Right | KeyCode::Char('l') => Some(FocusDirection::Right),
-                _ => None,
-            };
-            if let Some(direction) = direction {
-                self.move_view_focus(direction);
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') => self.move_view_focus(FocusDirection::Left),
+                KeyCode::Down | KeyCode::Char('j') => self.move_view_focus(FocusDirection::Down),
+                KeyCode::Up | KeyCode::Char('k') => self.move_view_focus(FocusDirection::Up),
+                KeyCode::Right | KeyCode::Char('l') => self.move_view_focus(FocusDirection::Right),
+                KeyCode::Char('+') => {
+                    self.resize_active_view(ResizeAxis::Height, ResizeAmount::Delta(1))
+                }
+                KeyCode::Char('-') => {
+                    self.resize_active_view(ResizeAxis::Height, ResizeAmount::Delta(-1))
+                }
+                KeyCode::Char('>') => {
+                    self.resize_active_view(ResizeAxis::Width, ResizeAmount::Delta(1))
+                }
+                KeyCode::Char('<') => {
+                    self.resize_active_view(ResizeAxis::Width, ResizeAmount::Delta(-1))
+                }
+                KeyCode::Char('=') => self.equalize_splits(),
+                _ => {}
             }
             return;
         }
@@ -853,6 +878,7 @@ impl App {
             "filter" => self.set_filter(argument),
             "sort" => self.set_sort(argument),
             "split" => self.split_view(argument),
+            "resize" => self.resize_command(argument),
             "tabnew" => self.tab_new(argument),
             "tabsetname" => self.tab_set_name(argument),
             "triage" if argument.is_none() => self.start_triage(),
@@ -1115,6 +1141,126 @@ impl App {
             SplitDirection::Horizontal => "View split horizontally".to_owned(),
             SplitDirection::Vertical => "View split vertically".to_owned(),
         });
+    }
+
+    fn resize_command(&mut self, argument: Option<&str>) {
+        let Some(argument) = argument.filter(|argument| !argument.is_empty()) else {
+            self.message = Some("E471: Argument required".to_owned());
+            return;
+        };
+        if argument == "equal" {
+            self.equalize_splits();
+            return;
+        }
+
+        let mut parts = argument.split_whitespace();
+        let axis = match parts.next() {
+            Some("height") => ResizeAxis::Height,
+            Some("width") => ResizeAxis::Width,
+            Some(value) => {
+                self.message = Some(format!("E474: Invalid resize dimension: {value}"));
+                return;
+            }
+            None => unreachable!(),
+        };
+        let Some(amount_text) = parts.next() else {
+            self.message = Some("E471: Resize amount required".to_owned());
+            return;
+        };
+        if parts.next().is_some() {
+            self.message = Some(format!("E488: Trailing characters: {argument}"));
+            return;
+        }
+        let amount = if let Some(value) = amount_text.strip_prefix('+') {
+            value.parse::<i16>().ok().map(ResizeAmount::Delta)
+        } else if let Some(value) = amount_text.strip_prefix('-') {
+            value
+                .parse::<i16>()
+                .ok()
+                .and_then(|value| value.checked_neg())
+                .map(ResizeAmount::Delta)
+        } else {
+            amount_text.parse::<u16>().ok().map(ResizeAmount::Absolute)
+        };
+        match amount {
+            Some(ResizeAmount::Delta(0) | ResizeAmount::Absolute(0)) | None => {
+                self.message = Some(format!("E474: Invalid resize amount: {amount_text}"));
+            }
+            Some(amount) => self.resize_active_view(axis, amount),
+        }
+    }
+
+    fn equalize_splits(&mut self) {
+        if self.active_tab().is_triage {
+            self.message = Some("E474: Triage views cannot be resized".to_owned());
+            return;
+        }
+        equalize_layout(&mut self.active_tab_mut().layout);
+        self.message = Some("Split views equalized".to_owned());
+    }
+
+    fn resize_active_view(&mut self, axis: ResizeAxis, amount: ResizeAmount) {
+        if self.active_tab().is_triage {
+            self.message = Some("E474: Triage views cannot be resized".to_owned());
+            return;
+        }
+        let active = self.active_tab().active_view;
+        let Some(root_area) = bounding_rect(&self.pane_areas) else {
+            self.message = Some("E474: View layout is not available".to_owned());
+            return;
+        };
+        let direction = match axis {
+            ResizeAxis::Height => SplitDirection::Horizontal,
+            ResizeAxis::Width => SplitDirection::Vertical,
+        };
+        let Some(target) =
+            nearest_resize_target(&self.active_tab().layout, root_area, active, direction)
+        else {
+            self.message = Some(format!(
+                "Active view has no resizable {} split",
+                match direction {
+                    SplitDirection::Horizontal => "horizontal",
+                    SplitDirection::Vertical => "vertical",
+                }
+            ));
+            return;
+        };
+        let Some((_, active_area)) = self.pane_areas.iter().find(|(index, _)| *index == active)
+        else {
+            self.message = Some("E474: Active view geometry is not available".to_owned());
+            return;
+        };
+        let current = match axis {
+            ResizeAxis::Height => active_area.height,
+            ResizeAxis::Width => active_area.width,
+        };
+        let delta = match amount {
+            ResizeAmount::Absolute(target) => i32::from(target) - i32::from(current),
+            ResizeAmount::Delta(delta) => i32::from(delta),
+        };
+        let minimum = match axis {
+            ResizeAxis::Height => MIN_VIEW_HEIGHT,
+            ResizeAxis::Width => MIN_VIEW_WIDTH,
+        };
+        match resize_layout_split(
+            &mut self.active_tab_mut().layout,
+            &target.path,
+            target.area,
+            target.active_in_first,
+            delta,
+            minimum,
+        ) {
+            Ok(()) => {
+                self.message = Some(format!(
+                    "Active view {} adjusted",
+                    match axis {
+                        ResizeAxis::Height => "height",
+                        ResizeAxis::Width => "width",
+                    }
+                ));
+            }
+            Err(message) => self.message = Some(message),
+        }
     }
 
     fn tab_new(&mut self, name: Option<&str>) {
@@ -1492,6 +1638,7 @@ fn split_layout_leaf(
         ViewLayout::Pane { index } if *index == target => {
             *layout = ViewLayout::Split {
                 direction,
+                ratio: EQUAL_SPLIT_RATIO,
                 first: Box::new(ViewLayout::Pane { index: target }),
                 second: Box::new(ViewLayout::Pane { index: new_index }),
             };
@@ -1511,18 +1658,27 @@ fn layout_areas(layout: &ViewLayout, area: Rect) -> Vec<(usize, Rect)> {
             ViewLayout::Pane { index } => areas.push((*index, area)),
             ViewLayout::Split {
                 direction,
+                ratio,
                 first,
                 second,
             } => {
                 let [first_area, second_area] = match direction {
-                    SplitDirection::Horizontal => {
-                        Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-                            .areas(area)
-                    }
-                    SplitDirection::Vertical => {
-                        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-                            .areas(area)
-                    }
+                    SplitDirection::Horizontal => Layout::vertical([
+                        Constraint::Ratio(*ratio as u32, SPLIT_RATIO_SCALE as u32),
+                        Constraint::Ratio(
+                            (SPLIT_RATIO_SCALE - *ratio) as u32,
+                            SPLIT_RATIO_SCALE as u32,
+                        ),
+                    ])
+                    .areas(area),
+                    SplitDirection::Vertical => Layout::horizontal([
+                        Constraint::Ratio(*ratio as u32, SPLIT_RATIO_SCALE as u32),
+                        Constraint::Ratio(
+                            (SPLIT_RATIO_SCALE - *ratio) as u32,
+                            SPLIT_RATIO_SCALE as u32,
+                        ),
+                    ])
+                    .areas(area),
                 };
                 collect(first, first_area, areas);
                 collect(second, second_area, areas);
@@ -1533,6 +1689,181 @@ fn layout_areas(layout: &ViewLayout, area: Rect) -> Vec<(usize, Rect)> {
     let mut areas = Vec::new();
     collect(layout, area, &mut areas);
     areas
+}
+
+struct ResizeTarget {
+    path: Vec<bool>,
+    area: Rect,
+    active_in_first: bool,
+}
+
+fn layout_contains(layout: &ViewLayout, target: usize) -> bool {
+    match layout {
+        ViewLayout::Pane { index } => *index == target,
+        ViewLayout::Split { first, second, .. } => {
+            layout_contains(first, target) || layout_contains(second, target)
+        }
+    }
+}
+
+fn split_child_areas(direction: SplitDirection, ratio: u16, area: Rect) -> (Rect, Rect) {
+    let constraints = [
+        Constraint::Ratio(ratio as u32, SPLIT_RATIO_SCALE as u32),
+        Constraint::Ratio((SPLIT_RATIO_SCALE - ratio) as u32, SPLIT_RATIO_SCALE as u32),
+    ];
+    match direction {
+        SplitDirection::Horizontal => {
+            let [first, second] = Layout::vertical(constraints).areas(area);
+            (first, second)
+        }
+        SplitDirection::Vertical => {
+            let [first, second] = Layout::horizontal(constraints).areas(area);
+            (first, second)
+        }
+    }
+}
+
+fn nearest_resize_target(
+    layout: &ViewLayout,
+    area: Rect,
+    active: usize,
+    direction: SplitDirection,
+) -> Option<ResizeTarget> {
+    fn find(
+        layout: &ViewLayout,
+        area: Rect,
+        active: usize,
+        direction: SplitDirection,
+        path: &mut Vec<bool>,
+    ) -> Option<ResizeTarget> {
+        let ViewLayout::Split {
+            direction: split_direction,
+            ratio,
+            first,
+            second,
+        } = layout
+        else {
+            return None;
+        };
+        let active_in_first = layout_contains(first, active);
+        let active_in_second = layout_contains(second, active);
+        if !active_in_first && !active_in_second {
+            return None;
+        }
+        let (first_area, second_area) = split_child_areas(*split_direction, *ratio, area);
+        path.push(!active_in_first);
+        let child = if active_in_first { first } else { second };
+        let child_area = if active_in_first {
+            first_area
+        } else {
+            second_area
+        };
+        if let Some(target) = find(child, child_area, active, direction, path) {
+            path.pop();
+            return Some(target);
+        }
+        path.pop();
+
+        (*split_direction == direction).then(|| ResizeTarget {
+            path: path.clone(),
+            area,
+            active_in_first,
+        })
+    }
+
+    find(layout, area, active, direction, &mut Vec::new())
+}
+
+fn resize_layout_split(
+    layout: &mut ViewLayout,
+    path: &[bool],
+    area: Rect,
+    active_in_first: bool,
+    delta: i32,
+    minimum: u16,
+) -> Result<(), String> {
+    let mut node = layout;
+    for second in path {
+        let ViewLayout::Split {
+            first,
+            second: second_layout,
+            ..
+        } = node
+        else {
+            return Err("E474: Saved split layout is invalid".to_owned());
+        };
+        node = if *second { second_layout } else { first };
+    }
+    let ViewLayout::Split {
+        direction, ratio, ..
+    } = node
+    else {
+        return Err("E474: Saved split layout is invalid".to_owned());
+    };
+    let total = match direction {
+        SplitDirection::Horizontal => area.height,
+        SplitDirection::Vertical => area.width,
+    };
+    if total < minimum.saturating_mul(2) {
+        return Err(format!(
+            "Split is too small to keep both views at least {minimum} cells"
+        ));
+    }
+    let (first_area, _) = split_child_areas(*direction, *ratio, area);
+    let first_size = match direction {
+        SplitDirection::Horizontal => first_area.height,
+        SplitDirection::Vertical => first_area.width,
+    };
+    let first_delta = if active_in_first { delta } else { -delta };
+    let first_size = (i32::from(first_size) + first_delta)
+        .clamp(i32::from(minimum), i32::from(total - minimum)) as u16;
+    *ratio = ((u32::from(first_size) * u32::from(SPLIT_RATIO_SCALE) + u32::from(total) / 2)
+        / u32::from(total)) as u16;
+    *ratio = (*ratio).clamp(1, SPLIT_RATIO_SCALE - 1);
+    Ok(())
+}
+
+fn equalize_layout(layout: &mut ViewLayout) -> usize {
+    match layout {
+        ViewLayout::Pane { .. } => 1,
+        ViewLayout::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            let first_count = equalize_layout(first);
+            let second_count = equalize_layout(second);
+            let total = first_count + second_count;
+            *ratio =
+                u16::try_from((first_count * usize::from(SPLIT_RATIO_SCALE) + total / 2) / total)
+                    .unwrap_or(EQUAL_SPLIT_RATIO)
+                    .clamp(1, SPLIT_RATIO_SCALE - 1);
+            total
+        }
+    }
+}
+
+fn bounding_rect(areas: &[(usize, Rect)]) -> Option<Rect> {
+    let first = areas.first()?.1;
+    let left = areas.iter().map(|(_, area)| area.x).min()?;
+    let top = areas.iter().map(|(_, area)| area.y).min()?;
+    let right = areas
+        .iter()
+        .map(|(_, area)| area.right())
+        .max()
+        .unwrap_or(first.right());
+    let bottom = areas
+        .iter()
+        .map(|(_, area)| area.bottom())
+        .max()
+        .unwrap_or(first.bottom());
+    Some(Rect::new(
+        left,
+        top,
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
+    ))
 }
 
 fn rect_center(area: Rect) -> (u16, u16) {
@@ -1997,6 +2328,7 @@ mod tests {
             app.active_tab().layout,
             ViewLayout::Split {
                 direction: SplitDirection::Vertical,
+                ratio: EQUAL_SPLIT_RATIO,
                 first: Box::new(ViewLayout::Pane { index: 0 }),
                 second: Box::new(ViewLayout::Pane { index: 1 }),
             }
@@ -2065,6 +2397,113 @@ mod tests {
         );
         assert_eq!(tabs[0].active_view, 1);
         assert!(matches!(tabs[0].layout, ViewLayout::Split { .. }));
+    }
+
+    fn split_ratio(layout: &ViewLayout) -> u16 {
+        match layout {
+            ViewLayout::Split { ratio, .. } => *ratio,
+            ViewLayout::Pane { .. } => panic!("expected split layout"),
+        }
+    }
+
+    #[test]
+    fn resize_command_supports_relative_and_absolute_widths() {
+        let mut app = app(2);
+        app.split_view(Some("vertical"));
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+
+        app.resize_command(Some("width +10"));
+        assert_eq!(split_ratio(&app.active_tab().layout), 400);
+
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+        app.resize_command(Some("width 30"));
+        assert_eq!(split_ratio(&app.active_tab().layout), 700);
+    }
+
+    #[test]
+    fn resize_clamps_both_views_to_minimum_size() {
+        let mut app = app(2);
+        app.split_view(Some("vertical"));
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+
+        app.resize_command(Some("width +100"));
+
+        let areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+        assert_eq!(areas[0].1.width, MIN_VIEW_WIDTH);
+        assert_eq!(areas[1].1.width, 100 - MIN_VIEW_WIDTH);
+    }
+
+    #[test]
+    fn resize_uses_nearest_matching_split_and_equalizes_leaf_views() {
+        let mut app = app(3);
+        app.split_view(Some("vertical"));
+        app.split_view(Some("vertical"));
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+
+        app.resize_command(Some("width +5"));
+
+        let ViewLayout::Split {
+            ratio: outer_ratio,
+            second,
+            ..
+        } = &app.active_tab().layout
+        else {
+            panic!("expected outer split");
+        };
+        assert_eq!(*outer_ratio, EQUAL_SPLIT_RATIO);
+        assert_eq!(split_ratio(second), 400);
+
+        app.resize_command(Some("equal"));
+        let ViewLayout::Split { ratio, second, .. } = &app.active_tab().layout else {
+            panic!("expected outer split");
+        };
+        assert_eq!(*ratio, 333);
+        assert_eq!(split_ratio(second), EQUAL_SPLIT_RATIO);
+    }
+
+    #[test]
+    fn resize_equal_gives_repeated_horizontal_splits_equal_heights() {
+        let mut app = app(4);
+        app.split_view(Some("horizontal"));
+        app.split_view(Some("horizontal"));
+        app.split_view(Some("horizontal"));
+
+        app.resize_command(Some("equal"));
+
+        let areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 80, 40));
+        assert_eq!(
+            areas
+                .iter()
+                .map(|(_, area)| area.height)
+                .collect::<Vec<_>>(),
+            vec![10, 10, 10, 10]
+        );
+    }
+
+    #[test]
+    fn ctrl_w_resize_shortcuts_adjust_active_view() {
+        let mut app = app(2);
+        app.split_view(Some("horizontal"));
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 80, 20));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('+')));
+
+        assert_eq!(split_ratio(&app.active_tab().layout), 450);
+    }
+
+    #[test]
+    fn resize_reports_when_no_matching_split_exists() {
+        let mut app = app(2);
+        app.split_view(Some("vertical"));
+        app.pane_areas = layout_areas(&app.active_tab().layout, Rect::new(0, 0, 100, 20));
+
+        app.resize_command(Some("height +1"));
+
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Active view has no resizable horizontal split")
+        );
     }
 
     #[test]

@@ -37,9 +37,24 @@ pub enum ViewLayout {
     },
     Split {
         direction: SplitDirection,
+        #[serde(
+            default = "default_split_ratio",
+            skip_serializing_if = "is_equal_split"
+        )]
+        ratio: u16,
         first: Box<ViewLayout>,
         second: Box<ViewLayout>,
     },
+}
+
+pub const EQUAL_SPLIT_RATIO: u16 = 500;
+
+fn default_split_ratio() -> u16 {
+    EQUAL_SPLIT_RATIO
+}
+
+fn is_equal_split(ratio: &u16) -> bool {
+    *ratio == EQUAL_SPLIT_RATIO
 }
 
 impl Default for ViewLayout {
@@ -207,7 +222,16 @@ impl ViewState {
         fn collect(layout: &ViewLayout, indexes: &mut Vec<usize>) {
             match layout {
                 ViewLayout::Pane { index } => indexes.push(*index),
-                ViewLayout::Split { first, second, .. } => {
+                ViewLayout::Split {
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => {
+                    if !(1..1000).contains(ratio) {
+                        indexes.push(usize::MAX);
+                        return;
+                    }
                     collect(first, indexes);
                     collect(second, indexes);
                 }
@@ -320,6 +344,7 @@ mod tests {
         });
         state.tabs[0].layout = ViewLayout::Split {
             direction: SplitDirection::Vertical,
+            ratio: 650,
             first: Box::new(ViewLayout::Pane { index: 0 }),
             second: Box::new(ViewLayout::Pane { index: 1 }),
         };
@@ -332,6 +357,25 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         assert_eq!(restored.tabs, state.tabs);
+    }
+
+    #[test]
+    fn split_layout_without_ratio_uses_equal_weight() {
+        let layout: ViewLayout = serde_json::from_value(serde_json::json!({
+            "type": "split",
+            "direction": "horizontal",
+            "first": { "type": "pane", "index": 0 },
+            "second": { "type": "pane", "index": 1 }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            layout,
+            ViewLayout::Split {
+                ratio: EQUAL_SPLIT_RATIO,
+                ..
+            }
+        ));
     }
 
     #[test]
