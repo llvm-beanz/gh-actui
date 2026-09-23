@@ -18,10 +18,17 @@ pub enum ParseRepositoryError {
 }
 
 impl Repository {
-    pub fn api_path(&self) -> String {
+    pub fn workflows_api_path(&self) -> String {
         format!(
             "repos/{}/{}/actions/workflows?per_page=100",
             self.owner, self.name
+        )
+    }
+
+    pub fn workflow_runs_api_path(&self, workflow_id: u64) -> String {
+        format!(
+            "repos/{}/{}/actions/workflows/{workflow_id}/runs?per_page=100",
+            self.owner, self.name,
         )
     }
 }

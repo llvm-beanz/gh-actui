@@ -8,9 +8,19 @@ gh actui <REPOSITORY>
 
 `REPOSITORY` can be an HTTPS GitHub URL or an `OWNER/REPO` name.
 
-The main table lists each workflow's name, state, and path. The highlighted row
-is the current selection, and the table scrolls automatically as the selection
-moves beyond the visible area.
+The main table lists the names and run status of active workflows. Workflows in
+any disabled or deleted state are omitted. The highlighted row is the current
+selection, and the table scrolls automatically as the selection moves beyond
+the visible area.
+
+| Status | Meaning |
+| --- | --- |
+| 🟢 | The latest completed run succeeded |
+| 🔴 | The latest completed run failed |
+| ⚪ | There is no completed run, or its conclusion was neither success nor failure |
+
+The status indicator flashes every half second while the workflow has a run in
+progress.
 
 ## Keyboard shortcuts
 

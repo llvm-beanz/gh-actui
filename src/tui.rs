@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -13,9 +13,13 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
-use crate::{github::Workflow, repository::Repository};
+use crate::{
+    github::{RunStatus, Workflow},
+    repository::Repository,
+};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STATUS_FLASH_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -37,6 +41,7 @@ struct App {
     message: Option<String>,
     pending_g: bool,
     should_quit: bool,
+    animation_started: Instant,
 }
 
 impl App {
@@ -55,6 +60,7 @@ impl App {
             message: None,
             pending_g: false,
             should_quit: false,
+            animation_started: Instant::now(),
         }
     }
 
@@ -260,7 +266,7 @@ impl App {
             Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
 
         if self.workflows.is_empty() {
-            let empty = Paragraph::new("This repository has no GitHub Actions workflows.")
+            let empty = Paragraph::new("This repository has no active GitHub Actions workflows.")
                 .centered()
                 .block(
                     Block::default()
@@ -269,41 +275,34 @@ impl App {
                 );
             frame.render_widget(empty, table_area);
         } else {
-            let header = Row::new(["Name", "State", "Path"])
+            let header = Row::new(["Status", "Name"])
                 .style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )
                 .bottom_margin(1);
+            let flash_visible = flash_visible(self.animation_started.elapsed());
             let rows = self.workflows.iter().map(|workflow| {
                 Row::new([
+                    Cell::from(status_indicator(workflow, flash_visible)),
                     Cell::from(workflow.name.as_str()),
-                    Cell::from(workflow.state.as_str()),
-                    Cell::from(workflow.path.as_str()),
                 ])
             });
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(30),
-                    Constraint::Length(20),
-                    Constraint::Min(20),
-                ],
-            )
-            .header(header)
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ")
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " {} - {} workflows ",
-                self.repository,
-                self.workflows.len()
-            )));
+            let table = Table::new(rows, [Constraint::Length(8), Constraint::Min(20)])
+                .header(header)
+                .row_highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ")
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    " {} - {} active workflows ",
+                    self.repository,
+                    self.workflows.len()
+                )));
 
             frame.render_stateful_widget(table, table_area, &mut self.table_state);
         }
@@ -333,6 +332,22 @@ impl App {
             }
         }
     }
+}
+
+fn status_indicator(workflow: &Workflow, flash_visible: bool) -> &'static str {
+    if workflow.is_in_progress && !flash_visible {
+        return "";
+    }
+
+    match workflow.run_status {
+        RunStatus::Success => "🟢",
+        RunStatus::Failure => "🔴",
+        RunStatus::Other => "⚪",
+    }
+}
+
+fn flash_visible(elapsed: Duration) -> bool {
+    (elapsed.as_millis() / STATUS_FLASH_INTERVAL.as_millis()).is_multiple_of(2)
 }
 
 fn char_to_byte_index(value: &str, character_index: usize) -> usize {
@@ -373,6 +388,8 @@ mod tests {
             name: format!("Workflow {id}"),
             path: format!(".github/workflows/{id}.yml"),
             state: "active".to_owned(),
+            run_status: RunStatus::Other,
+            is_in_progress: false,
         }
     }
 
@@ -530,5 +547,29 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.command_history.is_empty());
+    }
+
+    #[test]
+    fn status_indicator_reflects_last_completed_run() {
+        let mut workflow = workflow(1);
+
+        assert_eq!(status_indicator(&workflow, true), "⚪");
+        workflow.run_status = RunStatus::Success;
+        assert_eq!(status_indicator(&workflow, true), "🟢");
+        workflow.run_status = RunStatus::Failure;
+        assert_eq!(status_indicator(&workflow, true), "🔴");
+    }
+
+    #[test]
+    fn status_indicator_flashes_while_run_is_in_progress() {
+        let mut workflow = workflow(1);
+        workflow.run_status = RunStatus::Success;
+        workflow.is_in_progress = true;
+
+        assert_eq!(status_indicator(&workflow, true), "🟢");
+        assert_eq!(status_indicator(&workflow, false), "");
+        assert!(flash_visible(Duration::from_millis(499)));
+        assert!(!flash_visible(Duration::from_millis(500)));
+        assert!(flash_visible(Duration::from_millis(1000)));
     }
 }
