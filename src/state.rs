@@ -16,6 +16,10 @@ pub struct ViewState {
     version: u32,
     pub repository: Repository,
     pub workflow_ids: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +30,10 @@ struct StoredViewState {
     workflow_ids: Vec<u64>,
     #[serde(default)]
     workflows: Vec<StoredWorkflow>,
+    #[serde(default)]
+    filter: Option<String>,
+    #[serde(default)]
+    sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,11 +65,18 @@ pub enum Error {
 }
 
 impl ViewState {
-    pub fn new(repository: Repository, workflows: &[Workflow]) -> Self {
+    pub fn new(
+        repository: Repository,
+        workflows: &[Workflow],
+        filter: Option<String>,
+        sort: Option<String>,
+    ) -> Self {
         Self {
             version: CURRENT_VERSION,
             repository,
             workflow_ids: workflows.iter().map(|workflow| workflow.id).collect(),
+            filter,
+            sort,
         }
     }
 
@@ -93,6 +108,8 @@ impl ViewState {
             version: stored.version,
             repository: stored.repository,
             workflow_ids,
+            filter: stored.filter,
+            sort: stored.sort,
         })
     }
 
@@ -141,7 +158,12 @@ mod tests {
                 run_metrics: crate::github::RunMetrics::default(),
             },
         ];
-        ViewState::new("owner/repository".parse().unwrap(), &workflows)
+        ViewState::new(
+            "owner/repository".parse().unwrap(),
+            &workflows,
+            Some("status:success".to_owned()),
+            Some("name:desc".to_owned()),
+        )
     }
 
     #[test]
@@ -152,6 +174,8 @@ mod tests {
         assert_eq!(restored.version, CURRENT_VERSION);
         assert_eq!(restored.repository, state().repository);
         assert_eq!(restored.workflow_ids, vec![42, 7]);
+        assert_eq!(restored.filter.as_deref(), Some("status:success"));
+        assert_eq!(restored.sort.as_deref(), Some("name:desc"));
         assert!(restored.workflows.is_empty());
     }
 

@@ -23,6 +23,7 @@ use ratatui::{
 
 use crate::{
     github::{RunCounts, RunStatus, Workflow, WorkflowSource},
+    query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
     state::ViewState,
 };
@@ -43,6 +44,8 @@ struct PendingLoad {
     workflow_ids: Option<Vec<u64>>,
     state_path: Option<PathBuf>,
     kind: LoadKind,
+    filter: Option<String>,
+    sort: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +75,10 @@ struct App {
     animation_started: Instant,
     refresh_interval: Duration,
     next_refresh: Instant,
+    filter: Option<String>,
+    filter_expression: Option<FilterExpression>,
+    sort: Option<String>,
+    sort_spec: Option<SortSpec>,
 }
 
 impl App {
@@ -80,6 +87,8 @@ impl App {
         workflows: Vec<Workflow>,
         state_path: Option<PathBuf>,
         workflow_source: Arc<dyn WorkflowSource>,
+        filter: Option<String>,
+        sort: Option<String>,
     ) -> Self {
         let selected = (!workflows.is_empty()).then_some(0);
         Self {
@@ -102,6 +111,14 @@ impl App {
             animation_started: Instant::now(),
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
+            filter_expression: filter
+                .as_deref()
+                .and_then(|expression| FilterExpression::parse(expression).ok()),
+            sort_spec: sort
+                .as_deref()
+                .and_then(|specification| SortSpec::parse(specification).ok()),
+            filter,
+            sort,
         }
     }
 
@@ -110,13 +127,24 @@ impl App {
         workflow_ids: Option<Vec<u64>>,
         state_path: Option<PathBuf>,
         workflow_source: Arc<dyn WorkflowSource>,
+        filter: Option<String>,
+        sort: Option<String>,
     ) -> Self {
-        let mut app = Self::new(repository.clone(), Vec::new(), None, workflow_source);
+        let mut app = Self::new(
+            repository.clone(),
+            Vec::new(),
+            None,
+            workflow_source,
+            filter.clone(),
+            sort.clone(),
+        );
         app.start_loading(PendingLoad {
             repository,
             workflow_ids,
             state_path,
             kind: LoadKind::Initial,
+            filter,
+            sort,
         });
         app
     }
@@ -177,7 +205,7 @@ impl App {
                 let selected_id = self
                     .table_state
                     .selected()
-                    .and_then(|index| self.workflows.get(index))
+                    .and_then(|index| self.visible_workflows().get(index).copied())
                     .map(|workflow| workflow.id);
                 self.repository = pending.repository;
                 self.workflows = match pending.workflow_ids {
@@ -185,9 +213,22 @@ impl App {
                     None => workflows,
                 };
                 self.state_path = pending.state_path;
+                if pending.kind != LoadKind::Refresh {
+                    self.filter_expression = pending
+                        .filter
+                        .as_deref()
+                        .and_then(|expression| FilterExpression::parse(expression).ok());
+                    self.sort_spec = pending
+                        .sort
+                        .as_deref()
+                        .and_then(|specification| SortSpec::parse(specification).ok());
+                    self.filter = pending.filter;
+                    self.sort = pending.sort;
+                }
+                let visible = self.visible_workflows();
                 let selected = selected_id
-                    .and_then(|id| self.workflows.iter().position(|workflow| workflow.id == id))
-                    .or_else(|| (!self.workflows.is_empty()).then_some(0));
+                    .and_then(|id| visible.iter().position(|workflow| workflow.id == id))
+                    .or_else(|| (!visible.is_empty()).then_some(0));
                 self.table_state = TableState::default().with_selected(selected);
                 self.message = Some(match pending.kind {
                     LoadKind::Refresh => format!("{} workflows refreshed", self.workflows.len()),
@@ -203,6 +244,14 @@ impl App {
 
     fn is_loading(&self) -> bool {
         self.pending_load.is_some()
+    }
+
+    fn visible_workflows(&self) -> Vec<&Workflow> {
+        select_workflows(
+            &self.workflows,
+            self.filter_expression.as_ref(),
+            self.sort_spec.as_ref(),
+        )
     }
 
     fn refresh_if_due(&mut self) {
@@ -222,6 +271,8 @@ impl App {
             workflow_ids: Some(self.workflows.iter().map(|workflow| workflow.id).collect()),
             state_path: self.state_path.clone(),
             kind: LoadKind::Refresh,
+            filter: self.filter.clone(),
+            sort: self.sort.clone(),
         });
     }
 
@@ -370,6 +421,8 @@ impl App {
             "e" => self.edit_state(argument),
             "refresh" if argument.is_none() => self.refresh(),
             "refresh-rate" => self.set_refresh_rate(argument),
+            "filter" => self.set_filter(argument),
+            "sort" => self.set_sort(argument),
             "" => {}
             _ => self.message = Some(format!("E492: Not an editor command: {command}")),
         }
@@ -391,14 +444,22 @@ impl App {
             return;
         };
 
-        let end = selected.saturating_add(count).min(self.workflows.len());
-        let deleted = end - selected;
-        self.workflows.drain(selected..end);
+        let deleted_ids = self
+            .visible_workflows()
+            .into_iter()
+            .skip(selected)
+            .take(count)
+            .map(|workflow| workflow.id)
+            .collect::<Vec<_>>();
+        let deleted = deleted_ids.len();
+        self.workflows
+            .retain(|workflow| !deleted_ids.contains(&workflow.id));
 
-        let next_selection = if self.workflows.is_empty() {
+        let visible_count = self.visible_workflows().len();
+        let next_selection = if visible_count == 0 {
             None
         } else {
-            Some(selected.min(self.workflows.len() - 1))
+            Some(selected.min(visible_count - 1))
         };
         self.table_state.select(next_selection);
         self.message = Some(if deleted == 1 {
@@ -417,7 +478,12 @@ impl App {
             }
         };
 
-        let state = ViewState::new(self.repository.clone(), &self.workflows);
+        let state = ViewState::new(
+            self.repository.clone(),
+            &self.workflows,
+            self.filter.clone(),
+            self.sort.clone(),
+        );
         match state.save(&path) {
             Ok(()) => {
                 self.message = Some(format!(
@@ -450,6 +516,8 @@ impl App {
                 workflow_ids: Some(state.workflow_ids),
                 state_path: Some(path),
                 kind: LoadKind::Edit,
+                filter: state.filter,
+                sort: state.sort,
             }),
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
@@ -472,6 +540,51 @@ impl App {
         self.refresh_interval = Duration::from_secs(seconds);
         self.next_refresh = Instant::now() + self.refresh_interval;
         self.message = Some(format!("Refresh rate set to {seconds} seconds"));
+    }
+
+    fn set_filter(&mut self, argument: Option<&str>) {
+        let Some(expression) = argument.filter(|argument| !argument.is_empty()) else {
+            self.filter = None;
+            self.filter_expression = None;
+            self.reset_visible_selection();
+            self.message = Some("Filter cleared".to_owned());
+            return;
+        };
+
+        match FilterExpression::parse(expression) {
+            Ok(filter) => {
+                self.filter = Some(expression.to_owned());
+                self.filter_expression = Some(filter);
+                self.reset_visible_selection();
+                self.message = Some(format!("Filter: {expression}"));
+            }
+            Err(error) => self.message = Some(format!("E474: {error}")),
+        }
+    }
+
+    fn set_sort(&mut self, argument: Option<&str>) {
+        let Some(specification) = argument.filter(|argument| !argument.is_empty()) else {
+            self.sort = None;
+            self.sort_spec = None;
+            self.reset_visible_selection();
+            self.message = Some("Sort cleared".to_owned());
+            return;
+        };
+
+        match SortSpec::parse(specification) {
+            Ok(sort) => {
+                self.sort = Some(specification.to_owned());
+                self.sort_spec = Some(sort);
+                self.reset_visible_selection();
+                self.message = Some(format!("Sort: {specification}"));
+            }
+            Err(error) => self.message = Some(format!("E474: {error}")),
+        }
+    }
+
+    fn reset_visible_selection(&mut self) {
+        self.table_state
+            .select((!self.visible_workflows().is_empty()).then_some(0));
     }
 
     fn backspace_command(&mut self) {
@@ -531,17 +644,18 @@ impl App {
     }
 
     fn select_next(&mut self, amount: usize) {
-        if self.workflows.is_empty() {
+        let visible_count = self.visible_workflows().len();
+        if visible_count == 0 {
             return;
         }
 
         let current = self.table_state.selected().unwrap_or(0);
         self.table_state
-            .select(Some((current + amount).min(self.workflows.len() - 1)));
+            .select(Some((current + amount).min(visible_count - 1)));
     }
 
     fn select_previous(&mut self, amount: usize) {
-        if self.workflows.is_empty() {
+        if self.visible_workflows().is_empty() {
             return;
         }
 
@@ -551,24 +665,32 @@ impl App {
     }
 
     fn select_first(&mut self) {
-        if !self.workflows.is_empty() {
+        if !self.visible_workflows().is_empty() {
             self.table_state.select(Some(0));
         }
     }
 
     fn select_last(&mut self) {
-        if !self.workflows.is_empty() {
-            self.table_state.select(Some(self.workflows.len() - 1));
+        let visible_count = self.visible_workflows().len();
+        if visible_count > 0 {
+            self.table_state.select(Some(visible_count - 1));
         }
     }
 
     fn render(&mut self, frame: &mut Frame) {
         let [table_area, help_area] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
+        let visible_workflows = self
+            .visible_workflows()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
 
-        if self.workflows.is_empty() {
+        if visible_workflows.is_empty() {
             let empty_message = if self.is_loading() {
                 "Loading GitHub Actions workflows..."
+            } else if self.filter.is_some() {
+                "No workflows match the active filter."
             } else {
                 "This repository has no active GitHub Actions workflows."
             };
@@ -587,7 +709,7 @@ impl App {
                 )
                 .bottom_margin(1);
             let flash_visible = flash_visible(self.animation_started.elapsed());
-            let rows = self.workflows.iter().map(|workflow| {
+            let rows = visible_workflows.iter().map(|workflow| {
                 Row::new([
                     Cell::from(status_indicator(workflow, flash_visible)),
                     Cell::from(workflow.name.as_str()),
@@ -616,7 +738,7 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(format!(
                 " {} - {} active workflows ",
                 self.repository,
-                self.workflows.len()
+                visible_workflows.len()
             )));
 
             frame.render_stateful_widget(table, table_area, &mut self.table_state);
@@ -724,13 +846,22 @@ fn char_to_byte_index(value: &str, character_index: usize) -> usize {
 pub fn run(
     repository: Repository,
     workflow_ids: Option<Vec<u64>>,
+    filter: Option<String>,
+    sort: Option<String>,
     state_path: Option<PathBuf>,
     workflow_source: Arc<dyn WorkflowSource>,
 ) -> io::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::init();
-    let result =
-        App::new_loading(repository, workflow_ids, state_path, workflow_source).run(&mut terminal);
+    let result = App::new_loading(
+        repository,
+        workflow_ids,
+        state_path,
+        workflow_source,
+        filter,
+        sort,
+    )
+    .run(&mut terminal);
     ratatui::restore();
     result
 }
@@ -785,7 +916,14 @@ mod tests {
     fn app(workflow_count: u64) -> App {
         let repository = "owner/repository".parse().unwrap();
         let workflows = (0..workflow_count).map(workflow).collect();
-        App::new(repository, workflows, None, Arc::new(TestWorkflowSource))
+        App::new(
+            repository,
+            workflows,
+            None,
+            Arc::new(TestWorkflowSource),
+            None,
+            None,
+        )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -827,6 +965,8 @@ mod tests {
             None,
             None,
             Arc::new(TestWorkflowSource),
+            None,
+            None,
         );
 
         assert!(app.is_loading());
@@ -854,6 +994,8 @@ mod tests {
             Some(vec![3, 1]),
             Some(PathBuf::from("saved-view.json")),
             Arc::new(TestWorkflowSource),
+            None,
+            None,
         );
 
         complete_loading(&mut app);
@@ -1059,6 +1201,75 @@ mod tests {
     }
 
     #[test]
+    fn filter_command_applies_and_clears_visible_view() {
+        let mut app = app(3);
+
+        enter_command(&mut app, "filter name:Workflow*");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_workflows().len(), 3);
+        assert_eq!(app.filter.as_deref(), Some("name:Workflow*"));
+
+        enter_command(&mut app, "filter name:Workflow\\ 1");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_workflows().len(), 1);
+        assert_eq!(app.visible_workflows()[0].id, 1);
+
+        enter_command(&mut app, "filter");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_workflows().len(), 3);
+        assert!(app.filter.is_none());
+    }
+
+    #[test]
+    fn sort_command_applies_direction_and_clears() {
+        let mut app = app(3);
+        app.workflows[0].run_metrics.last_24_hours = RunCounts {
+            passed: 1,
+            failed: 9,
+            total: 10,
+        };
+        app.workflows[1].run_metrics.last_24_hours = RunCounts {
+            passed: 9,
+            failed: 1,
+            total: 10,
+        };
+
+        enter_command(&mut app, "sort 24h.rate:desc");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_workflows()[0].id, 1);
+
+        enter_command(&mut app, "sort");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_workflows()[0].id, 0);
+        assert!(app.sort.is_none());
+    }
+
+    #[test]
+    fn filter_and_sort_commands_report_parse_errors_without_changing_view() {
+        let mut app = app(2);
+
+        enter_command(&mut app, "filter name:\"unterminated");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.filter.is_none());
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("unterminated quote")
+        );
+
+        enter_command(&mut app, "sort name:sideways");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.sort.is_none());
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("invalid sort direction")
+        );
+    }
+
+    #[test]
     fn write_and_edit_commands_remember_path_and_restore_view() {
         let path = std::env::temp_dir().join(format!(
             "gh-actui-command-state-{}.json",
@@ -1066,6 +1277,10 @@ mod tests {
         ));
         let mut app = app(2);
 
+        enter_command(&mut app, "filter status:success");
+        app.handle_key(key(KeyCode::Enter));
+        enter_command(&mut app, "sort name:desc");
+        app.handle_key(key(KeyCode::Enter));
         enter_command(&mut app, &format!("w {}", path.display()));
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.state_path.as_ref(), Some(&path));
@@ -1081,6 +1296,8 @@ mod tests {
         assert_eq!(app.workflows.len(), 2);
         assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
         assert_eq!(app.workflows[0].run_status, RunStatus::Success);
+        assert_eq!(app.filter.as_deref(), Some("status:success"));
+        assert_eq!(app.sort.as_deref(), Some("name:desc"));
         assert_eq!(app.table_state.selected(), Some(0));
     }
 
@@ -1150,6 +1367,26 @@ mod tests {
         assert_eq!(ids, vec![0, 1, 2]);
         assert_eq!(app.table_state.selected(), Some(2));
         assert_eq!(app.message.as_deref(), Some("2 workflows deleted"));
+    }
+
+    #[test]
+    fn delete_count_follows_filtered_and_sorted_visible_order() {
+        let mut app = app(4);
+        enter_command(&mut app, "filter -name:Workflow\\ 0");
+        app.handle_key(key(KeyCode::Enter));
+        enter_command(&mut app, "sort name:desc");
+        app.handle_key(key(KeyCode::Enter));
+
+        enter_command(&mut app, "d2");
+        app.handle_key(key(KeyCode::Enter));
+
+        let ids = app
+            .workflows
+            .iter()
+            .map(|workflow| workflow.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1]);
+        assert_eq!(app.visible_workflows()[0].id, 1);
     }
 
     #[test]

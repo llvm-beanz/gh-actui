@@ -1,4 +1,5 @@
 mod github;
+mod query;
 mod repository;
 mod state;
 mod tui;
@@ -42,13 +43,19 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli, source: Arc<dyn WorkflowSource>) -> Result<(), Error> {
     let state_path = PathBuf::from(&cli.target);
-    let (repository, workflow_ids, state_path) = if state_path.is_file() {
+    let (repository, workflow_ids, filter, sort, state_path) = if state_path.is_file() {
         let state = ViewState::load(&state_path)?;
-        (state.repository, Some(state.workflow_ids), Some(state_path))
+        (
+            state.repository,
+            Some(state.workflow_ids),
+            state.filter,
+            state.sort,
+            Some(state_path),
+        )
     } else {
         let repository = cli.target.parse()?;
-        (repository, None, None)
+        (repository, None, None, None, None)
     };
-    tui::run(repository, workflow_ids, state_path, source)?;
+    tui::run(repository, workflow_ids, filter, sort, state_path, source)?;
     Ok(())
 }

@@ -77,6 +77,10 @@ to execute a command or Escape to return to Normal mode.
 | `:e [path]` | Load a saved view and refresh its workflows from GitHub |
 | `:refresh` | Refresh workflow and run data immediately |
 | `:refresh-rate N` | Refresh automatically every `N` seconds |
+| `:filter EXPRESSION` | Apply a GitHub Projects-style workflow filter |
+| `:filter` | Clear the active filter |
+| `:sort FIELD[:asc\|desc]` | Sort workflows by a field; ascending by default |
+| `:sort` | Clear the active sort |
 | `:d` | Delete the selected workflow from the view |
 | `:dN` | Delete `N` consecutive workflows starting at the selection |
 
@@ -85,6 +89,40 @@ There is no single-key quit binding in Normal mode.
 Deletion affects only the current view. Use `:w` to persist the updated
 workflow list. If the requested count extends past the end of the table, all
 remaining rows are deleted.
+
+### Filtering and sorting
+
+Filters support quoted values, comma-separated alternatives, negation,
+`has:`, `no:`, `is:`, general name text, `*` wildcards, comparisons, and
+inclusive ranges. Multiple clauses are combined with AND.
+
+Examples:
+
+```vim
+:filter status:failure
+:filter -status:success name:*Linux*
+:filter 24h.rate:<70 24h.total:>0
+:filter 7d.fail:1..*
+:sort name
+:sort 24h.rate:desc
+```
+
+Available fields are:
+
+| Field | Value |
+| --- | --- |
+| `name` or `workflow` | Workflow name |
+| `status` or `state` | `success`, `failure`, `other`, or `in_progress` |
+| `24h`, `7d`, `14d` | Pass percentage for that period |
+| `<period>.pass` | Passed run count |
+| `<period>.fail` | Failed run count |
+| `<period>.total` | Completed run count |
+| `<period>.rate` | Pass percentage |
+
+Periods accept `24h`, `7d`, or `14d`. Relative keywords such as `@me` are not
+supported. Active filter and sort specifications survive refreshes and are
+included in saved view files. `:dN` deletes rows in the current filtered and
+sorted order.
 
 After `:w path`, `:wq path`, or `:e path` succeeds, that path is remembered.
 Later write or edit commands without a path reuse it. A state file supplied on
