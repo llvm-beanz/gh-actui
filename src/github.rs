@@ -67,9 +67,39 @@ struct WorkflowRunPage {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowRun {
+    id: Option<u64>,
     status: Option<String>,
     conclusion: Option<String>,
+    event: Option<String>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowTriage {
+    pub workflow_id: u64,
+    pub failed_jobs: String,
+    pub failed_steps: String,
+    pub lit_summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobsPage {
+    jobs: Vec<Job>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Job {
+    id: u64,
+    name: String,
+    conclusion: Option<String>,
+    #[serde(default)]
+    steps: Vec<JobStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobStep {
+    name: String,
+    conclusion: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +116,11 @@ pub enum Error {
 
 pub trait WorkflowSource: Send + Sync {
     fn list_workflows(&self, repository: &Repository) -> Result<Vec<Workflow>, Error>;
+    fn triage_workflows(
+        &self,
+        repository: &Repository,
+        workflows: &[Workflow],
+    ) -> Result<Vec<WorkflowTriage>, Error>;
 }
 
 pub struct GhWorkflowSource;
@@ -99,6 +134,28 @@ impl WorkflowSource for GhWorkflowSource {
         load_run_statuses(repository, &mut workflows, Utc::now())?;
 
         Ok(workflows)
+    }
+
+    fn triage_workflows(
+        &self,
+        repository: &Repository,
+        workflows: &[Workflow],
+    ) -> Result<Vec<WorkflowTriage>, Error> {
+        let mut triage = Vec::new();
+        for chunk in workflows.chunks(MAX_CONCURRENT_REQUESTS) {
+            let results = thread::scope(|scope| {
+                let handles = chunk
+                    .iter()
+                    .map(|workflow| scope.spawn(move || triage_workflow(repository, workflow)))
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().map_err(|_| Error::StatusWorker)?)
+                    .collect::<Result<Vec<_>, Error>>()
+            })?;
+            triage.extend(results.into_iter().flatten());
+        }
+        Ok(triage)
     }
 }
 
@@ -273,6 +330,210 @@ fn record_run(counts: &mut RunCounts, conclusion: Option<&str>) {
     }
 }
 
+fn triage_workflow(
+    repository: &Repository,
+    workflow: &Workflow,
+) -> Result<Option<WorkflowTriage>, Error> {
+    if !workflow_has_schedule_trigger(repository, &workflow.path)? {
+        return Ok(None);
+    }
+    let runs_path = repository.workflow_runs_api_path(workflow.id);
+    let Some(run_id) = find_failed_scheduled_run(&runs_path)? else {
+        return Ok(None);
+    };
+    let failures = fetch_failed_jobs(repository, run_id)?;
+    let failed_jobs = failures
+        .iter()
+        .map(|failure| failure.job_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let failed_steps = failures
+        .iter()
+        .map(|failure| failure.step_name.as_deref().unwrap_or("(no step info)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut summaries = Vec::new();
+    for failure in failures
+        .iter()
+        .filter(|failure| failure.step_name.as_deref() == Some("Run HLSL Tests"))
+    {
+        let path = repository.job_logs_api_path(failure.job_id);
+        let log = successful_stdout(run_gh(&["api", &path])?)?;
+        if let Some(summary) = extract_lit_summary(&String::from_utf8_lossy(&log)) {
+            summaries.push(summary);
+        }
+    }
+
+    Ok(Some(WorkflowTriage {
+        workflow_id: workflow.id,
+        failed_jobs: if failed_jobs.is_empty() {
+            "(no failed jobs reported)".to_owned()
+        } else {
+            failed_jobs
+        },
+        failed_steps,
+        lit_summary: summaries.join("\n\n"),
+    }))
+}
+
+fn workflow_has_schedule_trigger(
+    repository: &Repository,
+    workflow_path: &str,
+) -> Result<bool, Error> {
+    let path = repository.workflow_content_api_path(workflow_path);
+    let contents = successful_stdout(run_gh(&[
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw+json",
+        &path,
+    ])?)?;
+    Ok(has_schedule_trigger(&String::from_utf8_lossy(&contents)))
+}
+
+fn has_schedule_trigger(contents: &str) -> bool {
+    let mut in_on_block = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if !in_on_block {
+            if line.trim_end() == "on:" {
+                in_on_block = true;
+            }
+            continue;
+        }
+        if !line.is_empty() && !line.starts_with([' ', '\t']) {
+            return false;
+        }
+        if line.starts_with([' ', '\t']) && trimmed == "schedule:" {
+            return true;
+        }
+    }
+    false
+}
+
+fn find_failed_scheduled_run(runs_path: &str) -> Result<Option<u64>, Error> {
+    find_failed_scheduled_run_with(runs_path, |path| {
+        successful_stdout(run_gh(&["api", "-X", "GET", path])?)
+    })
+}
+
+fn find_failed_scheduled_run_with(
+    runs_path: &str,
+    mut fetch_page: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<Option<u64>, Error> {
+    let mut page_number = 1;
+    let mut latest_scheduled = None;
+    let mut latest_completed = None;
+    loop {
+        let path = format!("{runs_path}&page={page_number}");
+        let page: WorkflowRunPage = serde_json::from_slice(&fetch_page(&path)?)?;
+        let page_len = page.workflow_runs.len();
+        for run in page.workflow_runs {
+            if run.event.as_deref() != Some("schedule") {
+                continue;
+            }
+            if latest_scheduled.is_none() {
+                latest_scheduled = Some((run.id, run.status.clone(), run.conclusion.clone()));
+            }
+            if run.status.as_deref() == Some("completed") && latest_completed.is_none() {
+                latest_completed = Some((run.id, run.conclusion));
+            }
+        }
+        if (latest_scheduled.is_some() && latest_completed.is_some()) || page_len < RUNS_PER_PAGE {
+            break;
+        }
+        page_number += 1;
+    }
+
+    let Some((latest_id, status, conclusion)) = latest_scheduled else {
+        return Ok(None);
+    };
+    if status.as_deref() == Some("completed") {
+        return Ok((conclusion.as_deref() == Some("failure"))
+            .then_some(latest_id)
+            .flatten());
+    }
+    Ok(latest_completed
+        .filter(|(_, conclusion)| conclusion.as_deref() == Some("failure"))
+        .and_then(|(id, _)| id))
+}
+
+struct FailedJob {
+    job_id: u64,
+    job_name: String,
+    step_name: Option<String>,
+}
+
+fn fetch_failed_jobs(repository: &Repository, run_id: u64) -> Result<Vec<FailedJob>, Error> {
+    let base_path = repository.run_jobs_api_path(run_id);
+    let mut failures = Vec::new();
+    let mut page_number = 1;
+    loop {
+        let path = format!("{base_path}&page={page_number}");
+        let page: JobsPage =
+            serde_json::from_slice(&successful_stdout(run_gh(&["api", "-X", "GET", &path])?)?)?;
+        let page_len = page.jobs.len();
+        for job in page.jobs {
+            if matches!(
+                job.conclusion.as_deref(),
+                None | Some("success" | "skipped" | "neutral")
+            ) {
+                continue;
+            }
+            let failed_step = job.steps.into_iter().find(|step| {
+                !matches!(
+                    step.conclusion.as_deref(),
+                    None | Some("success" | "skipped")
+                )
+            });
+            failures.push(FailedJob {
+                job_id: job.id,
+                job_name: job.name,
+                step_name: failed_step.map(|step| step.name),
+            });
+        }
+        if page_len < RUNS_PER_PAGE {
+            break;
+        }
+        page_number += 1;
+    }
+    Ok(failures)
+}
+
+fn extract_lit_summary(log: &str) -> Option<String> {
+    let lines = log.lines().map(strip_log_timestamp).collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .rposition(|line| line.starts_with("Failed Tests ("))
+        .or_else(|| {
+            lines
+                .iter()
+                .rposition(|line| line.starts_with("Testing Time:"))
+        })?;
+    let mut end = lines[start..]
+        .iter()
+        .position(|line| line.starts_with("##["))
+        .map_or(lines.len(), |offset| start + offset);
+    while end > start && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    Some(lines[start..end].join("\n"))
+}
+
+fn strip_log_timestamp(line: &str) -> &str {
+    let Some((prefix, remainder)) = line.split_once(' ') else {
+        return line;
+    };
+    if prefix.len() >= 20
+        && prefix.as_bytes().get(4) == Some(&b'-')
+        && prefix.as_bytes().get(7) == Some(&b'-')
+        && prefix.ends_with('Z')
+    {
+        remainder
+    } else {
+        line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -287,8 +548,10 @@ mod tests {
 
     fn run(status: &str, conclusion: Option<&str>, age: Duration) -> WorkflowRun {
         WorkflowRun {
+            id: None,
             status: Some(status.to_owned()),
             conclusion: conclusion.map(str::to_owned),
+            event: None,
             created_at: now() - age,
         }
     }
@@ -503,6 +766,91 @@ mod tests {
 
         assert_eq!(request_count, 1);
         assert_eq!(summary.run_metrics.last_14_days.total, 99);
+    }
+
+    #[test]
+    fn scheduled_triage_ignores_newer_non_scheduled_runs() {
+        let response = serde_json::to_vec(&json!({
+            "workflow_runs": [
+                {
+                    "id": 1,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "event": "push",
+                    "created_at": now().to_rfc3339()
+                },
+                {
+                    "id": 2,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "event": "schedule",
+                    "created_at": now().to_rfc3339()
+                }
+            ]
+        }))
+        .unwrap();
+
+        let run =
+            find_failed_scheduled_run_with("runs?per_page=100", |_| Ok(response.clone())).unwrap();
+
+        assert_eq!(run, None);
+    }
+
+    #[test]
+    fn schedule_trigger_detection_only_matches_top_level_on_block() {
+        assert!(has_schedule_trigger(
+            "name: Scheduled\non:\n  push:\n  schedule:\n    - cron: '0 0 * * *'\njobs:\n  test:\n"
+        ));
+        assert!(!has_schedule_trigger(
+            "name: Push\non:\n  push:\njobs:\n  schedule:\n    runs-on: ubuntu-latest\n"
+        ));
+        assert!(!has_schedule_trigger(
+            "name: Text\non: push\njobs:\n  test:\n    steps:\n      - run: echo schedule:\n"
+        ));
+    }
+
+    #[test]
+    fn scheduled_triage_uses_prior_failure_while_latest_run_is_in_flight() {
+        let response = serde_json::to_vec(&json!({
+            "workflow_runs": [
+                {
+                    "id": 10,
+                    "status": "in_progress",
+                    "conclusion": null,
+                    "event": "schedule",
+                    "created_at": now().to_rfc3339()
+                },
+                {
+                    "id": 9,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "event": "schedule",
+                    "created_at": (now() - Duration::days(1)).to_rfc3339()
+                }
+            ]
+        }))
+        .unwrap();
+
+        let run =
+            find_failed_scheduled_run_with("runs?per_page=100", |_| Ok(response.clone())).unwrap();
+
+        assert_eq!(run, Some(9));
+    }
+
+    #[test]
+    fn lit_summary_uses_last_failure_section_and_strips_timestamps() {
+        let log = "\
+2026-09-23T10:00:00.000Z Failed Tests (1):\n\
+2026-09-23T10:00:00.001Z   Suite :: old.test\n\
+2026-09-23T10:01:00.000Z Failed Tests (2):\n\
+2026-09-23T10:01:00.001Z   Suite :: one.test\n\
+2026-09-23T10:01:00.002Z   Suite :: two.test\n\
+2026-09-23T10:01:00.003Z ##[error]Process completed\n";
+
+        assert_eq!(
+            extract_lit_summary(log).as_deref(),
+            Some("Failed Tests (2):\n  Suite :: one.test\n  Suite :: two.test")
+        );
     }
 
     #[test]

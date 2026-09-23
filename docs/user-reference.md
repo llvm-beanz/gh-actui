@@ -96,6 +96,7 @@ The tab shortcuts work in both Normal and Command modes.
 | `:tabnext` or `:tabn` | Switch to the next tab |
 | `:tabprevious` or `:tabp` | Switch to the previous tab |
 | `:tabclose` or `:tabc` | Close the active tab |
+| `:triage` | Analyze visible failing workflows and open an enriched triage tab |
 | `:d` | Delete the selected workflow from the view |
 | `:dN` | Delete `N` consecutive workflows starting at the selection |
 
@@ -119,6 +120,33 @@ Unlike `ghui`, the `:tabnew` argument is not interpreted as a URL because one
 `gh-actui` process monitors only one repository. Tab navigation wraps at either
 end. Closing the only tab resets it to an empty view instead of exiting the
 application.
+
+### Failure triage
+
+`:triage` starts a background analysis of only the visible workflows whose
+latest completed run status is failing. It does not change the source tab.
+For each candidate, `gh-actui` first fetches its workflow YAML and excludes
+workflows without a top-level `on.schedule` trigger. This prevents
+non-scheduled workflows with large histories from forcing a scan of their
+entire run history. It then scans the unfiltered newest-first run history for
+scheduled runs. A completed scheduled failure is analyzed directly; when the
+newest scheduled run is still queued or in progress, the most recent completed
+scheduled failure is analyzed instead.
+
+The resulting `Triage` tab displays a vertically scrollable collection of
+bordered workflow panels. Each panel contains the failed jobs, first failed
+step for each job, and the extracted lit summary for failures in the
+`Run HLSL Tests` step. Lit summaries retain their original line structure and
+wrap to the terminal width. Use the normal `j`/`k`, arrow, paging, and jump
+bindings to move between workflow panels; the selected panel has a highlighted
+border. Workflows whose latest scheduled result is not a failure are omitted.
+Run, job, and log requests execute in the background and the footer displays
+`TRIAGING` while they are in progress.
+
+The triage tab's name and workflow subset are saved like any other tab.
+Fetched job, step, and log details are intentionally not saved because they
+may become stale; after loading a session, run `:triage` again to obtain fresh
+details.
 
 ### Filtering and sorting
 

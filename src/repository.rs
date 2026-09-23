@@ -32,6 +32,27 @@ impl Repository {
             self.owner, self.name,
         )
     }
+
+    pub fn workflow_content_api_path(&self, workflow_path: &str) -> String {
+        format!(
+            "repos/{}/{}/contents/{workflow_path}",
+            self.owner, self.name,
+        )
+    }
+
+    pub fn run_jobs_api_path(&self, run_id: u64) -> String {
+        format!(
+            "repos/{}/{}/actions/runs/{run_id}/jobs?per_page=100",
+            self.owner, self.name,
+        )
+    }
+
+    pub fn job_logs_api_path(&self, job_id: u64) -> String {
+        format!(
+            "repos/{}/{}/actions/jobs/{job_id}/logs",
+            self.owner, self.name,
+        )
+    }
 }
 
 impl fmt::Display for Repository {

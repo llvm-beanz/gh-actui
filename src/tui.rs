@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     sync::{
@@ -16,14 +17,14 @@ use crossterm::{
 };
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
-    text::Line,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs},
+    text::{Line, Text},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 
 use crate::{
-    github::{RunCounts, RunStatus, Workflow, WorkflowSource},
+    github::{RunCounts, RunStatus, Workflow, WorkflowSource, WorkflowTriage},
     query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
     state::{ViewState, ViewTab},
@@ -65,6 +66,7 @@ struct Tab {
     filter_expression: Option<FilterExpression>,
     sort: Option<String>,
     sort_spec: Option<SortSpec>,
+    is_triage: bool,
 }
 
 impl Tab {
@@ -86,6 +88,7 @@ impl Tab {
             workflow_ids,
             filter,
             sort,
+            is_triage: false,
         }
     }
 }
@@ -97,6 +100,8 @@ struct App {
     workflow_source: Arc<dyn WorkflowSource>,
     load_receiver: Option<Receiver<Result<Vec<Workflow>, crate::github::Error>>>,
     pending_load: Option<PendingLoad>,
+    triage_receiver: Option<Receiver<Result<Vec<WorkflowTriage>, crate::github::Error>>>,
+    triage: HashMap<u64, WorkflowTriage>,
     tabs: Vec<Tab>,
     active_tab: usize,
     mode: Mode,
@@ -149,6 +154,8 @@ impl App {
             workflow_source,
             load_receiver: None,
             pending_load: None,
+            triage_receiver: None,
+            triage: HashMap::new(),
             tabs,
             active_tab,
             mode: Mode::Normal,
@@ -191,6 +198,7 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.should_quit {
             self.poll_loading();
+            self.poll_triage();
             self.refresh_if_due();
             terminal.draw(|frame| self.render(frame))?;
 
@@ -231,6 +239,50 @@ impl App {
             }
         };
         self.finish_loading(result.map_err(|error| error.to_string()));
+    }
+
+    fn poll_triage(&mut self) {
+        let Some(receiver) = self.triage_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.triage_receiver = None;
+                self.message = Some("E484: workflow triage stopped unexpectedly".to_owned());
+                return;
+            }
+        };
+        self.triage_receiver = None;
+        self.finish_triage(result.map_err(|error| error.to_string()));
+    }
+
+    fn finish_triage(&mut self, result: Result<Vec<WorkflowTriage>, String>) {
+        match result {
+            Ok(results) => {
+                let workflow_ids = results
+                    .iter()
+                    .map(|result| result.workflow_id)
+                    .collect::<Vec<_>>();
+                self.triage.extend(
+                    results
+                        .into_iter()
+                        .map(|result| (result.workflow_id, result)),
+                );
+                let mut tab = Tab::new(Some("Triage".to_owned()), workflow_ids, None, None);
+                tab.is_triage = true;
+                tab.table_state
+                    .select((!tab.workflow_ids.is_empty()).then_some(0));
+                self.tabs.insert(self.active_tab + 1, tab);
+                self.active_tab += 1;
+                self.message = Some(format!(
+                    "{} failing scheduled workflows triaged",
+                    self.active_tab().workflow_ids.len()
+                ));
+            }
+            Err(error) => self.message = Some(format!("E484: {error}")),
+        }
     }
 
     fn finish_loading(&mut self, result: Result<Vec<Workflow>, String>) {
@@ -357,14 +409,17 @@ impl App {
     }
 
     fn refresh_if_due(&mut self) {
-        if !self.is_loading() && Instant::now() >= self.next_refresh {
+        if !self.is_loading()
+            && self.triage_receiver.is_none()
+            && Instant::now() >= self.next_refresh
+        {
             self.refresh();
         }
     }
 
     fn refresh(&mut self) {
-        if self.is_loading() {
-            self.message = Some("Refresh already in progress".to_owned());
+        if self.is_loading() || self.triage_receiver.is_some() {
+            self.message = Some("Triage or refresh already in progress".to_owned());
             return;
         }
 
@@ -383,7 +438,15 @@ impl App {
     }
 
     fn normal_status(&self) -> (&'static str, String) {
-        if let Some(pending) = self.pending_load.as_ref() {
+        if self.triage_receiver.is_some() {
+            (
+                " TRIAGING ",
+                format!(
+                    "Analyzing scheduled failures, jobs, steps, and logs...  |  {}",
+                    self.refresh_rate_label()
+                ),
+            )
+        } else if let Some(pending) = self.pending_load.as_ref() {
             let action = match pending.kind {
                 LoadKind::Refresh => "Refreshing",
                 LoadKind::Initial | LoadKind::Edit => "Loading",
@@ -547,6 +610,7 @@ impl App {
             "sort" => self.set_sort(argument),
             "tabnew" => self.tab_new(argument),
             "tabsetname" => self.tab_set_name(argument),
+            "triage" if argument.is_none() => self.start_triage(),
             "tabnext" | "tabn" if argument.is_none() => self.tab_next(),
             "tabprevious" | "tabp" if argument.is_none() => self.tab_previous(),
             "tabclose" | "tabc" if argument.is_none() => self.tab_close(),
@@ -740,6 +804,31 @@ impl App {
         self.message = Some(format!("{} opened", self.active_tab_label()));
     }
 
+    fn start_triage(&mut self) {
+        if self.is_loading() || self.triage_receiver.is_some() {
+            self.message = Some("Triage or refresh already in progress".to_owned());
+            return;
+        }
+        let workflows = self
+            .visible_workflows()
+            .into_iter()
+            .filter(|workflow| workflow.run_status == RunStatus::Failure)
+            .cloned()
+            .collect::<Vec<_>>();
+        if workflows.is_empty() {
+            self.message = Some("No failing workflows in the active view".to_owned());
+            return;
+        }
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.triage_workflows(&repository, &workflows));
+        });
+        self.triage_receiver = Some(receiver);
+        self.message = None;
+    }
+
     fn tab_set_name(&mut self, name: Option<&str>) {
         let Some(name) = name.filter(|name| !name.is_empty()) else {
             self.message = Some("E471: Argument required".to_owned());
@@ -923,7 +1012,11 @@ impl App {
             .collect::<Vec<_>>();
 
         if visible_workflows.is_empty() {
-            let empty_message = if self.is_loading() {
+            let empty_message = if self.triage_receiver.is_some() {
+                "Triaging failing workflows..."
+            } else if self.active_tab().is_triage {
+                "No failing scheduled workflows were found."
+            } else if self.is_loading() {
                 "Loading GitHub Actions workflows..."
             } else if self
                 .tabs
@@ -940,6 +1033,8 @@ impl App {
                     .title(format!(" {} ", self.repository)),
             );
             frame.render_widget(empty, table_area);
+        } else if self.active_tab().is_triage {
+            self.render_triage_blocks(frame, table_area, &visible_workflows);
         } else {
             let header = Row::new(["Status", "Name", "24 Hours", "7 Days", "14 Days"])
                 .style(
@@ -1010,6 +1105,69 @@ impl App {
             }
         }
     }
+
+    fn render_triage_blocks(&self, frame: &mut Frame, area: Rect, visible_workflows: &[Workflow]) {
+        let selected = self.active_tab().table_state.selected().unwrap_or(0);
+        let mut y = area.y;
+        for (index, workflow) in visible_workflows.iter().enumerate().skip(selected) {
+            if y >= area.bottom() {
+                break;
+            }
+            let triage = self.triage.get(&workflow.id);
+            let text = triage_text(triage);
+            let available_height = area.bottom() - y;
+            let height = triage_block_height(&text, area.width)
+                .min(available_height)
+                .max(1);
+            let block_area = Rect::new(area.x, y, area.width, height);
+            let selected_style = if index == selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let panel = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(selected_style)
+                    .title(format!(" {} ", workflow.name)),
+            );
+            frame.render_widget(panel, block_area);
+            y = y.saturating_add(height);
+        }
+    }
+}
+
+fn triage_text(triage: Option<&WorkflowTriage>) -> Text<'_> {
+    let Some(triage) = triage else {
+        return Text::from("(triage details unavailable)");
+    };
+    let mut lines = vec![
+        Line::from(format!("Failed jobs: {}", triage.failed_jobs)),
+        Line::from(format!("Failed steps: {}", triage.failed_steps)),
+    ];
+    if !triage.lit_summary.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from("lit summary:").bold());
+        lines.extend(triage.lit_summary.lines().map(Line::from));
+    }
+    Text::from(lines)
+}
+
+fn triage_block_height(text: &Text<'_>, width: u16) -> u16 {
+    let content_width = usize::from(width.saturating_sub(2).max(1));
+    let wrapped_lines = text
+        .lines
+        .iter()
+        .map(|line| {
+            let width = line.width();
+            width.max(1).div_ceil(content_width)
+        })
+        .sum::<usize>();
+    u16::try_from(wrapped_lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
 }
 
 fn command_path(argument: Option<&str>, remembered: Option<&PathBuf>) -> Result<PathBuf, String> {
@@ -1140,6 +1298,22 @@ mod tests {
                 })
                 .collect())
         }
+
+        fn triage_workflows(
+            &self,
+            _repository: &Repository,
+            workflows: &[Workflow],
+        ) -> Result<Vec<crate::github::WorkflowTriage>, crate::github::Error> {
+            Ok(workflows
+                .iter()
+                .map(|workflow| crate::github::WorkflowTriage {
+                    workflow_id: workflow.id,
+                    failed_jobs: format!("Job {}", workflow.id),
+                    failed_steps: "Run HLSL Tests".to_owned(),
+                    lit_summary: "Failed Tests (1): example.test".to_owned(),
+                })
+                .collect())
+        }
     }
 
     fn workflow(id: u64) -> Workflow {
@@ -1186,6 +1360,18 @@ mod tests {
             .unwrap()
             .map_err(|error| error.to_string());
         app.finish_loading(result);
+    }
+
+    fn complete_triage(app: &mut App) {
+        let result = app
+            .triage_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .map_err(|error| error.to_string());
+        app.triage_receiver = None;
+        app.finish_triage(result);
     }
 
     #[test]
@@ -1799,6 +1985,79 @@ mod tests {
 
         assert!(app.active_tab().name.is_none());
         assert_eq!(app.message.as_deref(), Some("E471: Argument required"));
+    }
+
+    #[test]
+    fn triage_uses_only_visible_failing_workflows_and_opens_result_tab() {
+        let mut app = app(4);
+        app.workflows[0].run_status = RunStatus::Failure;
+        app.workflows[1].run_status = RunStatus::Success;
+        app.workflows[2].run_status = RunStatus::Failure;
+        app.workflows[3].run_status = RunStatus::Failure;
+        enter_command(&mut app, "filter -name:Workflow\\ 3");
+        app.handle_key(key(KeyCode::Enter));
+
+        enter_command(&mut app, "triage");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.triage_receiver.is_some());
+        assert_eq!(app.normal_status().0, " TRIAGING ");
+        complete_triage(&mut app);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().name.as_deref(), Some("Triage"));
+        assert!(app.active_tab().is_triage);
+        assert_eq!(app.active_tab().workflow_ids, vec![0, 2]);
+        assert_eq!(app.triage[&0].failed_jobs, "Job 0");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("2 failing scheduled workflows triaged")
+        );
+    }
+
+    #[test]
+    fn triage_reports_when_active_view_has_no_failures() {
+        let mut app = app(2);
+
+        enter_command(&mut app, "triage");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.triage_receiver.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("No failing workflows in the active view")
+        );
+    }
+
+    #[test]
+    fn triage_text_preserves_multiline_lit_summary() {
+        let triage = WorkflowTriage {
+            workflow_id: 1,
+            failed_jobs: "Linux tests".to_owned(),
+            failed_steps: "Run HLSL Tests".to_owned(),
+            lit_summary: "Failed Tests (2):\n  Suite :: one.test\n  Suite :: two.test".to_owned(),
+        };
+
+        let text = triage_text(Some(&triage));
+        let lines = text
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            [
+                "Failed jobs: Linux tests",
+                "Failed steps: Run HLSL Tests",
+                "",
+                "lit summary:",
+                "Failed Tests (2):",
+                "  Suite :: one.test",
+                "  Suite :: two.test"
+            ]
+        );
+        assert_eq!(triage_block_height(&text, 80), 9);
     }
 
     #[test]
