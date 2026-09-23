@@ -14,15 +14,20 @@ gh auth login
 
 ## Run from source
 
-Pass either a GitHub repository URL or an `OWNER/REPO` name:
+Pass a GitHub repository URL, an `OWNER/REPO` name, or an existing JSON view
+state file:
 
 ```console
 cargo run -- https://github.com/llvm/offload-test-suite
 cargo run -- llvm/offload-test-suite
+cargo run -- saved-view.json
 ```
 
 The extension uses the authenticated `gh api` command to load all GitHub
 Actions workflows for the repository before opening the terminal UI.
+When a state file is supplied, the saved workflow IDs determine which
+workflows are displayed. Names, paths, workflow state, and run status are
+queried again from GitHub.
 
 ## Build
 

@@ -16,7 +16,10 @@ cargo run -- https://github.com/llvm/offload-test-suite
 
 The table displays the repository's active GitHub Actions workflows with
 at-a-glance run status and supports Vim-style keyboard selection, scrolling,
-and commands. Enter `:q` to exit.
+and commands. Views can be saved with `:w` and restored with `:e` or by passing
+the state file on the command line. Saved views contain stable workflow IDs;
+current workflow and run data is refreshed when they are loaded. Enter `:q` to
+exit.
 
 See [Getting started](docs/getting-started.md) for setup and authentication,
 and the [User reference](docs/user-reference.md) for arguments and shortcuts.

@@ -1,5 +1,5 @@
-use std::io;
 use std::time::{Duration, Instant};
+use std::{io, path::PathBuf};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -14,8 +14,9 @@ use ratatui::{
 };
 
 use crate::{
-    github::{RunStatus, Workflow},
+    github::{RunStatus, Workflow, WorkflowSource},
     repository::Repository,
+    state::ViewState,
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -28,9 +29,11 @@ enum Mode {
     Command,
 }
 
-struct App {
+struct App<'a> {
     repository: Repository,
     workflows: Vec<Workflow>,
+    state_path: Option<PathBuf>,
+    workflow_source: &'a dyn WorkflowSource,
     table_state: TableState,
     mode: Mode,
     command: String,
@@ -44,12 +47,19 @@ struct App {
     animation_started: Instant,
 }
 
-impl App {
-    fn new(repository: Repository, workflows: Vec<Workflow>) -> Self {
+impl<'a> App<'a> {
+    fn new(
+        repository: Repository,
+        workflows: Vec<Workflow>,
+        state_path: Option<PathBuf>,
+        workflow_source: &'a dyn WorkflowSource,
+    ) -> Self {
         let selected = (!workflows.is_empty()).then_some(0);
         Self {
             repository,
             workflows,
+            state_path,
+            workflow_source,
             table_state: TableState::default().with_selected(selected),
             mode: Mode::Normal,
             command: String::new(),
@@ -158,19 +168,85 @@ impl App {
             self.command_history.push(command.clone());
         }
 
-        if command == "q" {
-            self.should_quit = true;
-            return;
+        let (name, argument) = command
+            .split_once(char::is_whitespace)
+            .map_or((command.as_str(), None), |(name, argument)| {
+                (name, Some(argument.trim()))
+            });
+        match name {
+            "q" if argument.is_none() => {
+                self.should_quit = true;
+                return;
+            }
+            "w" => self.write_state(argument),
+            "e" => self.edit_state(argument),
+            "" => {}
+            _ => self.message = Some(format!("E492: Not an editor command: {command}")),
         }
 
-        if !command.is_empty() {
-            self.message = Some(format!("E492: Not an editor command: {command}"));
-        }
         self.command.clear();
         self.command_cursor = 0;
         self.history_index = None;
         self.history_draft.clear();
         self.mode = Mode::Normal;
+    }
+
+    fn write_state(&mut self, argument: Option<&str>) {
+        let path = match command_path(argument, self.state_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => {
+                self.message = Some(message);
+                return;
+            }
+        };
+
+        let state = ViewState::new(self.repository.clone(), &self.workflows);
+        match state.save(&path) {
+            Ok(()) => {
+                self.message = Some(format!(
+                    "\"{}\" {} workflows written",
+                    path.display(),
+                    self.workflows.len()
+                ));
+                self.state_path = Some(path);
+            }
+            Err(error) => self.message = Some(format!("E212: {error}")),
+        }
+    }
+
+    fn edit_state(&mut self, argument: Option<&str>) {
+        let path = match command_path(argument, self.state_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => {
+                self.message = Some(message);
+                return;
+            }
+        };
+
+        let loaded = ViewState::load(&path).and_then(|state| {
+            let workflows = self
+                .workflow_source
+                .list_workflows(&state.repository)
+                .map_err(crate::state::Error::Refresh)?;
+            let workflows = state.resolve_workflows(workflows);
+            Ok((state.repository, workflows))
+        });
+
+        match loaded {
+            Ok((repository, workflows)) => {
+                self.repository = repository;
+                self.workflows = workflows;
+                self.table_state =
+                    TableState::default().with_selected((!self.workflows.is_empty()).then_some(0));
+                self.message = Some(format!(
+                    "\"{}\" {} workflows loaded",
+                    path.display(),
+                    self.workflows.len()
+                ));
+                self.state_path = Some(path);
+            }
+            Err(error) => self.message = Some(format!("E484: {error}")),
+        }
     }
 
     fn backspace_command(&mut self) {
@@ -334,6 +410,15 @@ impl App {
     }
 }
 
+fn command_path(argument: Option<&str>, remembered: Option<&PathBuf>) -> Result<PathBuf, String> {
+    match argument.filter(|argument| !argument.is_empty()) {
+        Some(argument) => Ok(PathBuf::from(argument)),
+        None => remembered
+            .cloned()
+            .ok_or_else(|| "E32: No file name".to_owned()),
+    }
+}
+
 fn status_indicator(workflow: &Workflow, flash_visible: bool) -> &'static str {
     if workflow.is_in_progress && !flash_visible {
         return "";
@@ -357,10 +442,15 @@ fn char_to_byte_index(value: &str, character_index: usize) -> usize {
         .map_or(value.len(), |(index, _)| index)
 }
 
-pub fn run(repository: Repository, workflows: Vec<Workflow>) -> io::Result<()> {
+pub fn run(
+    repository: Repository,
+    workflows: Vec<Workflow>,
+    state_path: Option<PathBuf>,
+    workflow_source: &dyn WorkflowSource,
+) -> io::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::init();
-    let result = App::new(repository, workflows).run(&mut terminal);
+    let result = App::new(repository, workflows, state_path, workflow_source).run(&mut terminal);
     ratatui::restore();
     result
 }
@@ -382,6 +472,26 @@ fn restore_terminal() {
 mod tests {
     use super::*;
 
+    struct TestWorkflowSource;
+
+    static TEST_WORKFLOW_SOURCE: TestWorkflowSource = TestWorkflowSource;
+
+    impl WorkflowSource for TestWorkflowSource {
+        fn list_workflows(
+            &self,
+            _repository: &Repository,
+        ) -> Result<Vec<Workflow>, crate::github::Error> {
+            Ok((0..100)
+                .map(|id| {
+                    let mut workflow = workflow(id);
+                    workflow.name = format!("Refreshed Workflow {id}");
+                    workflow.run_status = RunStatus::Success;
+                    workflow
+                })
+                .collect())
+        }
+    }
+
     fn workflow(id: u64) -> Workflow {
         Workflow {
             id,
@@ -393,11 +503,10 @@ mod tests {
         }
     }
 
-    fn app(workflow_count: u64) -> App {
-        App::new(
-            "owner/repository".parse().unwrap(),
-            (0..workflow_count).map(workflow).collect(),
-        )
+    fn app(workflow_count: u64) -> App<'static> {
+        let repository = "owner/repository".parse().unwrap();
+        let workflows = (0..workflow_count).map(workflow).collect();
+        App::new(repository, workflows, None, &TEST_WORKFLOW_SOURCE)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -547,6 +656,41 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.command_history.is_empty());
+    }
+
+    #[test]
+    fn write_and_edit_commands_remember_path_and_restore_view() {
+        let path = std::env::temp_dir().join(format!(
+            "gh-actui-command-state-{}.json",
+            std::process::id()
+        ));
+        let mut app = app(2);
+
+        enter_command(&mut app, &format!("w {}", path.display()));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.state_path.as_ref(), Some(&path));
+        assert!(path.is_file());
+
+        app.workflows.clear();
+        enter_command(&mut app, "e");
+        app.handle_key(key(KeyCode::Enter));
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(app.workflows.len(), 2);
+        assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
+        assert_eq!(app.workflows[0].run_status, RunStatus::Success);
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn write_command_without_path_reports_error() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "w");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.message.as_deref(), Some("E32: No file name"));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

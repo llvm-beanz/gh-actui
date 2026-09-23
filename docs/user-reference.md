@@ -3,10 +3,11 @@
 ## Usage
 
 ```console
-gh actui <REPOSITORY>
+gh actui <REPOSITORY_OR_STATE_FILE>
 ```
 
-`REPOSITORY` can be an HTTPS GitHub URL or an `OWNER/REPO` name.
+The argument can be an HTTPS GitHub URL, an `OWNER/REPO` name, or the path to
+an existing JSON view state file.
 
 The main table lists the names and run status of active workflows. Workflows in
 any disabled or deleted state are omitted. The highlighted row is the current
@@ -54,5 +55,17 @@ to execute a command or Escape to return to Normal mode.
 | Command | Action |
 | --- | --- |
 | `:q` | Exit |
+| `:w [path]` | Save the repository and displayed workflows as JSON |
+| `:e [path]` | Load a saved view and refresh its workflows from GitHub |
 
 There is no single-key quit binding in Normal mode.
+
+After `:w path` or `:e path` succeeds, that path is remembered. Later `:w` or
+`:e` commands without a path reuse it. A state file supplied on the command
+line is also remembered. Using `:w` or `:e` without a remembered path reports
+an error.
+
+State files contain only the repository identity and the IDs of the workflows
+in the view. Workflow names, paths, enablement state, and run status are not
+saved because they may change; they are queried from GitHub whenever a state
+file is loaded.
