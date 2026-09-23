@@ -174,14 +174,21 @@ scheduled failure is analyzed instead.
 The resulting `Triage` tab displays a vertically scrollable collection of
 bordered panels. The first panel correlates tests reported by more than one
 workflow, with separate sections for failures and unexpected passes and a list
-of the affected workflows under each test. If nothing is shared, it states
-that explicitly.
+of the affected workflows under each test. Correlation uses the same structured
+per-workflow test lists displayed in the individual panels, with raw lit
+summary parsing retained as a fallback. If nothing is shared, it states that
+explicitly.
 
 Each following workflow panel contains the failed jobs, first failed step for
 each job, and the extracted lit summary for failures in the `Run HLSL Tests`
-step. Lit summaries retain their original line structure and wrap to the
-terminal width. Use the normal `j`/`k`, arrow, paging, and jump bindings to
-move between workflow panels; the selected panel has a highlighted border.
+step. Each summary includes the individual tests listed under both `Failed
+Tests` and `Unexpectedly Passed Tests`, when present. Each workflow panel also
+shows explicit `Failed tests` and `Unexpectedly passed tests` lists parsed
+from those summary sections or, as a fallback, the detailed `FAIL:` and
+`XPASS:` result lines. Lit summaries retain their original line structure and
+wrap to the terminal width. Use the normal `j`/`k`, arrow, paging, and jump
+bindings to move between workflow panels; the selected panel has a highlighted
+border.
 Workflows whose latest scheduled result is not a failure are omitted. Run,
 job, and log requests execute in the background and the footer displays
 `TRIAGING` while they are in progress.

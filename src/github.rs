@@ -79,6 +79,8 @@ pub struct WorkflowTriage {
     pub workflow_id: u64,
     pub failed_jobs: String,
     pub failed_steps: String,
+    pub failed_tests: Vec<String>,
+    pub unexpectedly_passed_tests: Vec<String>,
     pub lit_summary: String,
 }
 
@@ -353,16 +355,26 @@ fn triage_workflow(
         .collect::<Vec<_>>()
         .join(", ");
     let mut summaries = Vec::new();
+    let mut failed_tests = Vec::new();
+    let mut unexpectedly_passed_tests = Vec::new();
     for failure in failures
         .iter()
         .filter(|failure| failure.step_name.as_deref() == Some("Run HLSL Tests"))
     {
         let path = repository.job_logs_api_path(failure.job_id);
         let log = successful_stdout(run_gh(&["api", &path])?)?;
-        if let Some(summary) = extract_lit_summary(&String::from_utf8_lossy(&log)) {
+        let log = String::from_utf8_lossy(&log);
+        let (job_failed_tests, job_unexpectedly_passed_tests) = extract_lit_test_names(&log);
+        failed_tests.extend(job_failed_tests);
+        unexpectedly_passed_tests.extend(job_unexpectedly_passed_tests);
+        if let Some(summary) = extract_lit_summary(&log) {
             summaries.push(summary);
         }
     }
+    failed_tests.sort();
+    failed_tests.dedup();
+    unexpectedly_passed_tests.sort();
+    unexpectedly_passed_tests.dedup();
 
     Ok(Some(WorkflowTriage {
         workflow_id: workflow.id,
@@ -372,6 +384,8 @@ fn triage_workflow(
             failed_jobs
         },
         failed_steps,
+        failed_tests,
+        unexpectedly_passed_tests,
         lit_summary: summaries.join("\n\n"),
     }))
 }
@@ -501,13 +515,33 @@ fn fetch_failed_jobs(repository: &Repository, run_id: u64) -> Result<Vec<FailedJ
 
 fn extract_lit_summary(log: &str) -> Option<String> {
     let lines = log.lines().map(strip_log_timestamp).collect::<Vec<_>>();
-    let start = lines
+    let testing_time = lines
         .iter()
-        .rposition(|line| line.starts_with("Failed Tests ("))
-        .or_else(|| {
-            lines
+        .rposition(|line| line.starts_with("Testing Time:"));
+    let start = testing_time
+        .and_then(|testing_time| {
+            let section_start = testing_time + 1;
+            lines[section_start..]
                 .iter()
-                .rposition(|line| line.starts_with("Testing Time:"))
+                .position(|line| {
+                    line.starts_with("Failed Tests (")
+                        || line.starts_with("Unexpectedly Passed Tests (")
+                })
+                .map(|offset| section_start + offset)
+                .or(Some(testing_time))
+        })
+        .or_else(|| {
+            let failed = lines
+                .iter()
+                .rposition(|line| line.starts_with("Failed Tests ("));
+            let unexpectedly_passed = lines
+                .iter()
+                .rposition(|line| line.starts_with("Unexpectedly Passed Tests ("));
+            match (failed, unexpectedly_passed) {
+                (Some(failed), Some(unexpected)) => Some(failed.max(unexpected)),
+                (Some(index), None) | (None, Some(index)) => Some(index),
+                (None, None) => None,
+            }
         })?;
     let mut end = lines[start..]
         .iter()
@@ -520,9 +554,7 @@ fn extract_lit_summary(log: &str) -> Option<String> {
 }
 
 fn strip_log_timestamp(line: &str) -> &str {
-    let Some((prefix, remainder)) = line.split_once(' ') else {
-        return line;
-    };
+    let (prefix, remainder) = line.split_once(' ').unwrap_or((line, ""));
     if prefix.len() >= 20
         && prefix.as_bytes().get(4) == Some(&b'-')
         && prefix.as_bytes().get(7) == Some(&b'-')
@@ -532,6 +564,74 @@ fn strip_log_timestamp(line: &str) -> &str {
     } else {
         line
     }
+}
+
+fn extract_lit_test_names(log: &str) -> (Vec<String>, Vec<String>) {
+    let lines = log.lines().map(strip_log_timestamp).collect::<Vec<_>>();
+    let mut failed = Vec::new();
+    let mut unexpectedly_passed = Vec::new();
+    let mut section = None;
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Failed Tests (") {
+            section = Some(true);
+            continue;
+        }
+        if trimmed.starts_with("Unexpectedly Passed Tests (") {
+            section = Some(false);
+            continue;
+        }
+        if trimmed.starts_with("**") || trimmed.starts_with("##[") {
+            section = None;
+            continue;
+        }
+        if trimmed.starts_with("FAIL:") || trimmed.starts_with("XPASS:") {
+            section = None;
+            continue;
+        }
+        if let (Some(failed_section), Some((_, test))) = (section, trimmed.split_once("::")) {
+            let target = if failed_section {
+                &mut failed
+            } else {
+                &mut unexpectedly_passed
+            };
+            target.push(strip_lit_test_suffix(test));
+        }
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(test) = detailed_lit_test_name(trimmed, "FAIL:") {
+            failed.push(test);
+        } else if let Some(test) = detailed_lit_test_name(trimmed, "XPASS:") {
+            unexpectedly_passed.push(test);
+        }
+    }
+    failed.sort();
+    failed.dedup();
+    unexpectedly_passed.sort();
+    unexpectedly_passed.dedup();
+    (failed, unexpectedly_passed)
+}
+
+fn detailed_lit_test_name(line: &str, prefix: &str) -> Option<String> {
+    let remainder = line.strip_prefix(prefix)?.trim();
+    let (_, test) = remainder.split_once("::")?;
+    Some(strip_lit_test_suffix(test))
+}
+
+fn strip_lit_test_suffix(test: &str) -> String {
+    let test = test.trim();
+    test.rsplit_once(" (")
+        .filter(|(_, suffix)| {
+            suffix
+                .strip_suffix(')')
+                .is_some_and(|suffix| suffix.contains(" of "))
+        })
+        .map_or(test, |(test, _)| test)
+        .trim()
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -850,6 +950,61 @@ mod tests {
         assert_eq!(
             extract_lit_summary(log).as_deref(),
             Some("Failed Tests (2):\n  Suite :: one.test\n  Suite :: two.test")
+        );
+    }
+
+    #[test]
+    fn lit_summary_includes_failed_and_unexpectedly_passed_tests() {
+        let log = "\
+2026-09-23T12:00:00Z Testing Time: 1.23s
+2026-09-23T12:00:01Z Unexpectedly Passed Tests (1):
+2026-09-23T12:00:02Z   Suite :: unexpected.test
+2026-09-23T12:00:03Z
+2026-09-23T12:00:04Z Failed Tests (2):
+2026-09-23T12:00:05Z   Suite :: failed-one.test
+2026-09-23T12:00:06Z   Suite :: failed-two.test
+2026-09-23T12:00:07Z ##[error]Process completed with exit code 1.";
+
+        assert_eq!(
+            extract_lit_summary(log).as_deref(),
+            Some(
+                "Unexpectedly Passed Tests (1):\n  Suite :: unexpected.test\n\nFailed Tests (2):\n  Suite :: failed-one.test\n  Suite :: failed-two.test"
+            )
+        );
+    }
+
+    #[test]
+    fn lit_summary_includes_unexpectedly_passed_tests_without_failures() {
+        let log = "\
+Testing Time: 1.23s
+Unexpectedly Passed Tests (1):
+  Suite :: unexpected.test
+##[error]Process completed with exit code 1.";
+
+        assert_eq!(
+            extract_lit_summary(log).as_deref(),
+            Some("Unexpectedly Passed Tests (1):\n  Suite :: unexpected.test")
+        );
+    }
+
+    #[test]
+    fn lit_test_names_use_summary_sections_and_detailed_result_fallbacks() {
+        let log = "\
+Testing Time: 1.23s
+Unexpectedly Passed Tests (1):
+  Suite :: unexpected.test
+Failed Tests (1):
+  Suite :: failed.test
+FAIL: Suite :: fallback-failed.test (1 of 20)
+XPASS: Suite :: fallback-unexpected.test (2 of 20)
+##[error]Process completed with exit code 1.";
+
+        let (failed, unexpectedly_passed) = extract_lit_test_names(log);
+
+        assert_eq!(failed, ["failed.test", "fallback-failed.test"]);
+        assert_eq!(
+            unexpectedly_passed,
+            ["fallback-unexpected.test", "unexpected.test"]
         );
     }
 

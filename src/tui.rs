@@ -2003,12 +2003,34 @@ fn triage_correlation_summary<'a>(
         let Some(workflow_name) = names.get(&result.workflow_id).copied() else {
             continue;
         };
+        let mut workflow_failed = result
+            .failed_tests
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut workflow_unexpectedly_passed = result
+            .unexpectedly_passed_tests
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         for (outcome, test_name) in lit_test_names(&result.lit_summary) {
-            let target = match outcome {
-                TestOutcome::Failed => &mut failed,
-                TestOutcome::UnexpectedlyPassed => &mut unexpectedly_passed,
-            };
-            target.entry(test_name).or_default().insert(workflow_name);
+            match outcome {
+                TestOutcome::Failed => {
+                    workflow_failed.insert(test_name);
+                }
+                TestOutcome::UnexpectedlyPassed => {
+                    workflow_unexpectedly_passed.insert(test_name);
+                }
+            }
+        }
+        for test_name in workflow_failed {
+            failed.entry(test_name).or_default().insert(workflow_name);
+        }
+        for test_name in workflow_unexpectedly_passed {
+            unexpectedly_passed
+                .entry(test_name)
+                .or_default()
+                .insert(workflow_name);
         }
     }
 
@@ -2082,6 +2104,26 @@ fn triage_text(triage: Option<&WorkflowTriage>) -> Text<'_> {
         Line::from(format!("Failed jobs: {}", triage.failed_jobs)),
         Line::from(format!("Failed steps: {}", triage.failed_steps)),
     ];
+    if !triage.failed_tests.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from("Failed tests:").bold());
+        lines.extend(
+            triage
+                .failed_tests
+                .iter()
+                .map(|test| Line::from(format!("  - {test}"))),
+        );
+    }
+    if !triage.unexpectedly_passed_tests.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from("Unexpectedly passed tests:").bold());
+        lines.extend(
+            triage
+                .unexpectedly_passed_tests
+                .iter()
+                .map(|test| Line::from(format!("  - {test}"))),
+        );
+    }
     if !triage.lit_summary.is_empty() {
         lines.push(Line::default());
         lines.push(Line::from("lit summary:").bold());
@@ -2250,6 +2292,8 @@ mod tests {
                     workflow_id: workflow.id,
                     failed_jobs: format!("Job {}", workflow.id),
                     failed_steps: "Run HLSL Tests".to_owned(),
+                    failed_tests: vec!["example.test".to_owned()],
+                    unexpectedly_passed_tests: Vec::new(),
                     lit_summary: "Failed Tests (1): example.test".to_owned(),
                 })
                 .collect())
@@ -3245,6 +3289,8 @@ mod tests {
             workflow_id: 1,
             failed_jobs: "Linux tests".to_owned(),
             failed_steps: "Run HLSL Tests".to_owned(),
+            failed_tests: vec!["one.test".to_owned(), "two.test".to_owned()],
+            unexpectedly_passed_tests: vec!["flaky.test".to_owned()],
             lit_summary: "Failed Tests (2):\n  Suite :: one.test\n  Suite :: two.test".to_owned(),
         };
 
@@ -3261,13 +3307,20 @@ mod tests {
                 "Failed jobs: Linux tests",
                 "Failed steps: Run HLSL Tests",
                 "",
+                "Failed tests:",
+                "  - one.test",
+                "  - two.test",
+                "",
+                "Unexpectedly passed tests:",
+                "  - flaky.test",
+                "",
                 "lit summary:",
                 "Failed Tests (2):",
                 "  Suite :: one.test",
                 "  Suite :: two.test"
             ]
         );
-        assert_eq!(triage_block_height(&text, 80), 9);
+        assert_eq!(triage_block_height(&text, 80), 16);
     }
 
     #[test]
@@ -3280,6 +3333,8 @@ mod tests {
                 workflow_id: 1,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_tests: Vec::new(),
+                unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "\
 Failed Tests (2):
   Suite :: common-failure.test
@@ -3295,6 +3350,8 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 2,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_tests: Vec::new(),
+                unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "\
 Failed Tests (1):
   Suite :: common-failure.test
@@ -3309,6 +3366,8 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 3,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_tests: Vec::new(),
+                unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "Failed Tests (1):\n  Suite :: another-unique.test".to_owned(),
             },
         );
@@ -3333,6 +3392,8 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 1,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_tests: Vec::new(),
+                unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "Failed Tests (1):\n  Suite :: unique.test".to_owned(),
             },
         )]);
@@ -3341,6 +3402,54 @@ Unexpectedly Passed Tests (1):
             triage_correlation_summary(&workflows, &triage).to_string(),
             "No tests failed or unexpectedly passed in multiple workflows."
         );
+    }
+
+    #[test]
+    fn triage_summary_correlates_structured_tests_when_raw_summary_is_missing() {
+        let workflows = vec![workflow(1), workflow(2), workflow(3)];
+        let triage = HashMap::from([
+            (
+                1,
+                WorkflowTriage {
+                    workflow_id: 1,
+                    failed_jobs: String::new(),
+                    failed_steps: String::new(),
+                    failed_tests: vec!["shared-failure.test".to_owned()],
+                    unexpectedly_passed_tests: vec!["shared-xpass.test".to_owned()],
+                    lit_summary: String::new(),
+                },
+            ),
+            (
+                2,
+                WorkflowTriage {
+                    workflow_id: 2,
+                    failed_jobs: String::new(),
+                    failed_steps: String::new(),
+                    failed_tests: vec!["shared-failure.test".to_owned(), "unique.test".to_owned()],
+                    unexpectedly_passed_tests: vec!["shared-xpass.test".to_owned()],
+                    lit_summary: String::new(),
+                },
+            ),
+            (
+                3,
+                WorkflowTriage {
+                    workflow_id: 3,
+                    failed_jobs: String::new(),
+                    failed_steps: String::new(),
+                    failed_tests: vec!["another-unique.test".to_owned()],
+                    unexpectedly_passed_tests: Vec::new(),
+                    lit_summary: String::new(),
+                },
+            ),
+        ]);
+
+        let summary = triage_correlation_summary(&workflows, &triage).to_string();
+
+        assert!(summary.contains("shared-failure.test"));
+        assert!(summary.contains("shared-xpass.test"));
+        assert!(summary.contains("Workflow 1"));
+        assert!(summary.contains("Workflow 2"));
+        assert!(!summary.contains("unique.test"));
     }
 
     #[test]
