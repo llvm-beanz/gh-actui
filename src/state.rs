@@ -11,15 +11,26 @@ use crate::{github::Workflow, repository::Repository};
 
 const CURRENT_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ViewState {
-    version: u32,
-    pub repository: Repository,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewTab {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub workflow_ids: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_workflow_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ViewState {
+    version: u32,
+    pub repository: Repository,
+    pub workflow_ids: Vec<u64>,
+    pub tabs: Vec<ViewTab>,
+    pub active_tab: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +45,10 @@ struct StoredViewState {
     filter: Option<String>,
     #[serde(default)]
     sort: Option<String>,
+    #[serde(default)]
+    tabs: Vec<ViewTab>,
+    #[serde(default)]
+    active_tab: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,15 +83,15 @@ impl ViewState {
     pub fn new(
         repository: Repository,
         workflows: &[Workflow],
-        filter: Option<String>,
-        sort: Option<String>,
+        tabs: Vec<ViewTab>,
+        active_tab: usize,
     ) -> Self {
         Self {
             version: CURRENT_VERSION,
             repository,
             workflow_ids: workflows.iter().map(|workflow| workflow.id).collect(),
-            filter,
-            sort,
+            active_tab: active_tab.min(tabs.len().saturating_sub(1)),
+            tabs,
         }
     }
 
@@ -104,12 +119,22 @@ impl ViewState {
         } else {
             stored.workflow_ids
         };
+        let mut tabs = stored.tabs;
+        if tabs.is_empty() {
+            tabs.push(ViewTab {
+                name: None,
+                workflow_ids: workflow_ids.clone(),
+                filter: stored.filter,
+                sort: stored.sort,
+                selected_workflow_id: None,
+            });
+        }
         Ok(Self {
             version: stored.version,
             repository: stored.repository,
             workflow_ids,
-            filter: stored.filter,
-            sort: stored.sort,
+            active_tab: stored.active_tab.min(tabs.len().saturating_sub(1)),
+            tabs,
         })
     }
 
@@ -161,8 +186,14 @@ mod tests {
         ViewState::new(
             "owner/repository".parse().unwrap(),
             &workflows,
-            Some("status:success".to_owned()),
-            Some("name:desc".to_owned()),
+            vec![ViewTab {
+                name: Some("Failures".to_owned()),
+                workflow_ids: vec![42, 7],
+                filter: Some("status:success".to_owned()),
+                sort: Some("name:desc".to_owned()),
+                selected_workflow_id: Some(7),
+            }],
+            0,
         )
     }
 
@@ -174,16 +205,19 @@ mod tests {
         assert_eq!(restored.version, CURRENT_VERSION);
         assert_eq!(restored.repository, state().repository);
         assert_eq!(restored.workflow_ids, vec![42, 7]);
-        assert_eq!(restored.filter.as_deref(), Some("status:success"));
-        assert_eq!(restored.sort.as_deref(), Some("name:desc"));
+        assert_eq!(restored.tabs[0].filter.as_deref(), Some("status:success"));
+        assert_eq!(restored.tabs[0].sort.as_deref(), Some("name:desc"));
+        assert_eq!(restored.tabs[0].name.as_deref(), Some("Failures"));
+        assert_eq!(restored.tabs[0].selected_workflow_id, Some(7));
         assert!(restored.workflows.is_empty());
     }
 
     #[test]
-    fn view_state_serializes_only_repository_and_workflow_ids() {
+    fn view_state_excludes_fetched_workflow_data() {
         let json = serde_json::to_value(state()).unwrap();
 
         assert_eq!(json["workflow_ids"], serde_json::json!([42, 7]));
+        assert_eq!(json["tabs"][0]["workflow_ids"], serde_json::json!([42, 7]));
         assert!(json.get("workflows").is_none());
         let serialized = json.to_string();
         assert!(!serialized.contains("Build"));
@@ -248,7 +282,9 @@ mod tests {
                 "workflows": [
                     {"id": 42, "name": "Stale", "path": "stale.yml", "state": "active",
                      "run_status": "failure", "is_in_progress": true}
-                ]
+                ],
+                "filter": "status:failure",
+                "sort": "name:desc"
             }"#,
         )
         .unwrap();
@@ -257,6 +293,9 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         assert_eq!(restored.workflow_ids, vec![42]);
+        assert_eq!(restored.tabs[0].workflow_ids, vec![42]);
+        assert_eq!(restored.tabs[0].filter.as_deref(), Some("status:failure"));
+        assert_eq!(restored.tabs[0].sort.as_deref(), Some("name:desc"));
     }
 
     #[test]

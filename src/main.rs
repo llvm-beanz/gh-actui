@@ -43,19 +43,26 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli, source: Arc<dyn WorkflowSource>) -> Result<(), Error> {
     let state_path = PathBuf::from(&cli.target);
-    let (repository, workflow_ids, filter, sort, state_path) = if state_path.is_file() {
+    let (repository, workflow_ids, tabs, active_tab, state_path) = if state_path.is_file() {
         let state = ViewState::load(&state_path)?;
         (
             state.repository,
             Some(state.workflow_ids),
-            state.filter,
-            state.sort,
+            Some(state.tabs),
+            state.active_tab,
             Some(state_path),
         )
     } else {
         let repository = cli.target.parse()?;
-        (repository, None, None, None, None)
+        (repository, None, None, 0, None)
     };
-    tui::run(repository, workflow_ids, filter, sort, state_path, source)?;
+    tui::run(
+        repository,
+        workflow_ids,
+        tabs,
+        active_tab,
+        state_path,
+        source,
+    )?;
     Ok(())
 }

@@ -54,7 +54,11 @@ to execute a command or Escape to return to Normal mode.
 | `Ctrl-u` or Page Up | Move backward up to 10 workflows |
 | `gg` or Home | Select the first workflow |
 | `G` or End | Select the last workflow |
+| `Ctrl+Tab` | Switch to the next tab |
+| `Ctrl+Shift+Tab` | Switch to the previous tab |
 | `:` | Enter Command mode |
+
+The tab shortcuts work in both Normal and Command modes.
 
 ### Command-line editing
 
@@ -81,14 +85,34 @@ to execute a command or Escape to return to Normal mode.
 | `:filter` | Clear the active filter |
 | `:sort FIELD[:asc\|desc]` | Sort workflows by a field; ascending by default |
 | `:sort` | Clear the active sort |
+| `:tabnew [name]` | Duplicate the active workflow view in an optionally named tab |
+| `:tabsetname NAME` | Change the active tab's displayed name |
+| `:tabnext` or `:tabn` | Switch to the next tab |
+| `:tabprevious` or `:tabp` | Switch to the previous tab |
+| `:tabclose` or `:tabc` | Close the active tab |
 | `:d` | Delete the selected workflow from the view |
 | `:dN` | Delete `N` consecutive workflows starting at the selection |
 
 There is no single-key quit binding in Normal mode.
 
-Deletion affects only the current view. Use `:w` to persist the updated
-workflow list. If the requested count extends past the end of the table, all
-remaining rows are deleted.
+Deletion affects only the active tab; the process-wide workflow data remains
+available to other tabs. Use `:w` to persist the updated tab. If the requested
+count extends past the end of the table, all remaining rows are deleted.
+
+### Tabs
+
+The process fetches and refreshes one global workflow collection for the
+repository. Tabs are lightweight views over that collection. Each tab has its
+own workflow subset, selected row, filter, and sort.
+
+`:tabnew [name]` duplicates the active tab and switches to the duplicate
+without performing another network request. The optional argument, including
+spaces, becomes the tab's displayed name; unnamed tabs use `Tab N`.
+`:tabsetname NAME` changes the active tab's name and also accepts spaces.
+Unlike `ghui`, the `:tabnew` argument is not interpreted as a URL because one
+`gh-actui` process monitors only one repository. Tab navigation wraps at either
+end. Closing the only tab resets it to an empty view instead of exiting the
+application.
 
 ### Filtering and sorting
 
@@ -120,16 +144,18 @@ Available fields are:
 | `<period>.rate` | Pass percentage |
 
 Periods accept `24h`, `7d`, or `14d`. Relative keywords such as `@me` are not
-supported. Active filter and sort specifications survive refreshes and are
-included in saved view files. `:dN` deletes rows in the current filtered and
-sorted order.
+supported. Filters and sorts apply only to the active tab, survive refreshes,
+and are included in saved view files. `:dN` deletes rows in the current
+filtered and sorted order.
 
 After `:w path`, `:wq path`, or `:e path` succeeds, that path is remembered.
 Later write or edit commands without a path reuse it. A state file supplied on
 the command line is also remembered. Using `:w`, `:wq`, or `:e` without a
 remembered path reports an error. `:wq` does not exit if saving fails.
 
-State files contain only the repository identity and the IDs of the workflows
-in the view. Workflow names, paths, enablement state, and run status are not
-saved because they may change; they are queried from GitHub whenever a state
-file is loaded.
+State files contain the repository identity, the global monitored workflow
+IDs, every tab in tab-bar order, each tab's name, workflow IDs, filter, sort,
+and selected workflow, and the active tab. Workflow names, paths, enablement
+state, and run status are not saved because they may change; they are queried
+from GitHub whenever a state file is loaded. Existing single-view state files
+load as one unnamed tab.

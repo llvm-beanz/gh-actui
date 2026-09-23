@@ -18,14 +18,15 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style, Stylize},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    text::Line,
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs},
 };
 
 use crate::{
     github::{RunCounts, RunStatus, Workflow, WorkflowSource},
     query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
-    state::ViewState,
+    state::{ViewState, ViewTab},
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -44,8 +45,8 @@ struct PendingLoad {
     workflow_ids: Option<Vec<u64>>,
     state_path: Option<PathBuf>,
     kind: LoadKind,
-    filter: Option<String>,
-    sort: Option<String>,
+    tabs: Option<Vec<ViewTab>>,
+    active_tab: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +56,40 @@ enum LoadKind {
     Refresh,
 }
 
+#[derive(Clone)]
+struct Tab {
+    name: Option<String>,
+    workflow_ids: Vec<u64>,
+    table_state: TableState,
+    filter: Option<String>,
+    filter_expression: Option<FilterExpression>,
+    sort: Option<String>,
+    sort_spec: Option<SortSpec>,
+}
+
+impl Tab {
+    fn new(
+        name: Option<String>,
+        workflow_ids: Vec<u64>,
+        filter: Option<String>,
+        sort: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            table_state: TableState::default(),
+            filter_expression: filter
+                .as_deref()
+                .and_then(|expression| FilterExpression::parse(expression).ok()),
+            sort_spec: sort
+                .as_deref()
+                .and_then(|specification| SortSpec::parse(specification).ok()),
+            workflow_ids,
+            filter,
+            sort,
+        }
+    }
+}
+
 struct App {
     repository: Repository,
     workflows: Vec<Workflow>,
@@ -62,7 +97,8 @@ struct App {
     workflow_source: Arc<dyn WorkflowSource>,
     load_receiver: Option<Receiver<Result<Vec<Workflow>, crate::github::Error>>>,
     pending_load: Option<PendingLoad>,
-    table_state: TableState,
+    tabs: Vec<Tab>,
+    active_tab: usize,
     mode: Mode,
     command: String,
     command_cursor: usize,
@@ -75,10 +111,6 @@ struct App {
     animation_started: Instant,
     refresh_interval: Duration,
     next_refresh: Instant,
-    filter: Option<String>,
-    filter_expression: Option<FilterExpression>,
-    sort: Option<String>,
-    sort_spec: Option<SortSpec>,
 }
 
 impl App {
@@ -87,18 +119,38 @@ impl App {
         workflows: Vec<Workflow>,
         state_path: Option<PathBuf>,
         workflow_source: Arc<dyn WorkflowSource>,
-        filter: Option<String>,
-        sort: Option<String>,
+        saved_tabs: Option<(Vec<ViewTab>, usize)>,
     ) -> Self {
-        let selected = (!workflows.is_empty()).then_some(0);
-        Self {
+        let (tabs, active_tab) = saved_tabs.map_or_else(
+            || {
+                (
+                    vec![Tab::new(
+                        None,
+                        workflows.iter().map(|workflow| workflow.id).collect(),
+                        None,
+                        None,
+                    )],
+                    0,
+                )
+            },
+            |(tabs, active_tab)| {
+                let tabs = tabs
+                    .into_iter()
+                    .map(|tab| Tab::new(tab.name, tab.workflow_ids, tab.filter, tab.sort))
+                    .collect::<Vec<_>>();
+                let active_tab = active_tab.min(tabs.len().saturating_sub(1));
+                (tabs, active_tab)
+            },
+        );
+        let mut app = Self {
             repository,
             workflows,
             state_path,
             workflow_source,
             load_receiver: None,
             pending_load: None,
-            table_state: TableState::default().with_selected(selected),
+            tabs,
+            active_tab,
             mode: Mode::Normal,
             command: String::new(),
             command_cursor: 0,
@@ -111,15 +163,9 @@ impl App {
             animation_started: Instant::now(),
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
-            filter_expression: filter
-                .as_deref()
-                .and_then(|expression| FilterExpression::parse(expression).ok()),
-            sort_spec: sort
-                .as_deref()
-                .and_then(|specification| SortSpec::parse(specification).ok()),
-            filter,
-            sort,
-        }
+        };
+        app.repair_all_tab_selections(None);
+        app
     }
 
     fn new_loading(
@@ -127,24 +173,17 @@ impl App {
         workflow_ids: Option<Vec<u64>>,
         state_path: Option<PathBuf>,
         workflow_source: Arc<dyn WorkflowSource>,
-        filter: Option<String>,
-        sort: Option<String>,
+        tabs: Option<Vec<ViewTab>>,
+        active_tab: usize,
     ) -> Self {
-        let mut app = Self::new(
-            repository.clone(),
-            Vec::new(),
-            None,
-            workflow_source,
-            filter.clone(),
-            sort.clone(),
-        );
+        let mut app = Self::new(repository.clone(), Vec::new(), None, workflow_source, None);
         app.start_loading(PendingLoad {
             repository,
             workflow_ids,
             state_path,
             kind: LoadKind::Initial,
-            filter,
-            sort,
+            tabs,
+            active_tab,
         });
         app
     }
@@ -202,11 +241,7 @@ impl App {
 
         match result {
             Ok(workflows) => {
-                let selected_id = self
-                    .table_state
-                    .selected()
-                    .and_then(|index| self.visible_workflows().get(index).copied())
-                    .map(|workflow| workflow.id);
+                let selected_ids = self.selected_workflow_ids();
                 self.repository = pending.repository;
                 self.workflows = match pending.workflow_ids {
                     Some(workflow_ids) => ViewState::resolve_workflows(&workflow_ids, workflows),
@@ -214,22 +249,37 @@ impl App {
                 };
                 self.state_path = pending.state_path;
                 if pending.kind != LoadKind::Refresh {
-                    self.filter_expression = pending
-                        .filter
-                        .as_deref()
-                        .and_then(|expression| FilterExpression::parse(expression).ok());
-                    self.sort_spec = pending
-                        .sort
-                        .as_deref()
-                        .and_then(|specification| SortSpec::parse(specification).ok());
-                    self.filter = pending.filter;
-                    self.sort = pending.sort;
+                    self.tabs = pending.tabs.map_or_else(
+                        || {
+                            vec![Tab::new(
+                                None,
+                                self.workflows.iter().map(|workflow| workflow.id).collect(),
+                                None,
+                                None,
+                            )]
+                        },
+                        |tabs| {
+                            tabs.into_iter()
+                                .map(|tab| {
+                                    let mut runtime =
+                                        Tab::new(tab.name, tab.workflow_ids, tab.filter, tab.sort);
+                                    runtime
+                                        .table_state
+                                        .select(tab.selected_workflow_id.and_then(|id| {
+                                            self.visible_workflows_for(&runtime)
+                                                .iter()
+                                                .position(|workflow| workflow.id == id)
+                                        }));
+                                    runtime
+                                })
+                                .collect()
+                        },
+                    );
+                    self.active_tab = pending.active_tab.min(self.tabs.len().saturating_sub(1));
                 }
-                let visible = self.visible_workflows();
-                let selected = selected_id
-                    .and_then(|id| visible.iter().position(|workflow| workflow.id == id))
-                    .or_else(|| (!visible.is_empty()).then_some(0));
-                self.table_state = TableState::default().with_selected(selected);
+                self.repair_all_tab_selections(
+                    (pending.kind == LoadKind::Refresh).then_some(selected_ids),
+                );
                 self.message = Some(match pending.kind {
                     LoadKind::Refresh => format!("{} workflows refreshed", self.workflows.len()),
                     LoadKind::Initial | LoadKind::Edit => {
@@ -247,11 +297,63 @@ impl App {
     }
 
     fn visible_workflows(&self) -> Vec<&Workflow> {
-        select_workflows(
+        self.tabs
+            .get(self.active_tab)
+            .map_or_else(Vec::new, |tab| self.visible_workflows_for(tab))
+    }
+
+    fn visible_workflows_for(&self, tab: &Tab) -> Vec<&Workflow> {
+        let mut workflows = select_workflows(
             &self.workflows,
-            self.filter_expression.as_ref(),
-            self.sort_spec.as_ref(),
-        )
+            tab.filter_expression.as_ref(),
+            tab.sort_spec.as_ref(),
+        );
+        workflows.retain(|workflow| tab.workflow_ids.contains(&workflow.id));
+        workflows
+    }
+
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    fn selected_workflow_ids(&self) -> Vec<Option<u64>> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                tab.table_state
+                    .selected()
+                    .and_then(|index| self.visible_workflows_for(tab).get(index).copied())
+                    .map(|workflow| workflow.id)
+            })
+            .collect()
+    }
+
+    fn repair_all_tab_selections(&mut self, selected_ids: Option<Vec<Option<u64>>>) {
+        let selections = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let visible = self.visible_workflows_for(tab);
+                selected_ids
+                    .as_ref()
+                    .and_then(|ids| ids.get(index).copied().flatten())
+                    .and_then(|id| visible.iter().position(|workflow| workflow.id == id))
+                    .or_else(|| {
+                        tab.table_state
+                            .selected()
+                            .filter(|selected| *selected < visible.len())
+                    })
+                    .or_else(|| (!visible.is_empty()).then_some(0))
+            })
+            .collect::<Vec<_>>();
+        for (tab, selection) in self.tabs.iter_mut().zip(selections) {
+            tab.table_state.select(selection);
+        }
     }
 
     fn refresh_if_due(&mut self) {
@@ -271,8 +373,8 @@ impl App {
             workflow_ids: Some(self.workflows.iter().map(|workflow| workflow.id).collect()),
             state_path: self.state_path.clone(),
             kind: LoadKind::Refresh,
-            filter: self.filter.clone(),
-            sort: self.sort.clone(),
+            tabs: None,
+            active_tab: self.active_tab,
         });
     }
 
@@ -303,7 +405,9 @@ impl App {
                 " NORMAL ",
                 self.message
                     .as_deref()
-                    .unwrap_or("j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  gg/G: jump  |  :q: quit")
+                    .unwrap_or(
+                        "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit",
+                    )
                     .to_owned()
                     + "  |  "
                     + &self.refresh_rate_label(),
@@ -312,6 +416,24 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.tab_previous();
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.tab_next();
+                    return;
+                }
+                KeyCode::BackTab => {
+                    self.tab_previous();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Command => self.handle_command_key(key),
@@ -423,6 +545,11 @@ impl App {
             "refresh-rate" => self.set_refresh_rate(argument),
             "filter" => self.set_filter(argument),
             "sort" => self.set_sort(argument),
+            "tabnew" => self.tab_new(argument),
+            "tabsetname" => self.tab_set_name(argument),
+            "tabnext" | "tabn" if argument.is_none() => self.tab_next(),
+            "tabprevious" | "tabp" if argument.is_none() => self.tab_previous(),
+            "tabclose" | "tabc" if argument.is_none() => self.tab_close(),
             "" => {}
             _ => self.message = Some(format!("E492: Not an editor command: {command}")),
         }
@@ -439,7 +566,7 @@ impl App {
     }
 
     fn delete_rows(&mut self, count: usize) {
-        let Some(selected) = self.table_state.selected() else {
+        let Some(selected) = self.active_tab().table_state.selected() else {
             self.message = Some("E749: Empty buffer".to_owned());
             return;
         };
@@ -452,8 +579,9 @@ impl App {
             .map(|workflow| workflow.id)
             .collect::<Vec<_>>();
         let deleted = deleted_ids.len();
-        self.workflows
-            .retain(|workflow| !deleted_ids.contains(&workflow.id));
+        self.active_tab_mut()
+            .workflow_ids
+            .retain(|id| !deleted_ids.contains(id));
 
         let visible_count = self.visible_workflows().len();
         let next_selection = if visible_count == 0 {
@@ -461,7 +589,7 @@ impl App {
         } else {
             Some(selected.min(visible_count - 1))
         };
-        self.table_state.select(next_selection);
+        self.active_tab_mut().table_state.select(next_selection);
         self.message = Some(if deleted == 1 {
             "1 workflow deleted".to_owned()
         } else {
@@ -478,11 +606,26 @@ impl App {
             }
         };
 
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| ViewTab {
+                name: tab.name.clone(),
+                workflow_ids: tab.workflow_ids.clone(),
+                filter: tab.filter.clone(),
+                sort: tab.sort.clone(),
+                selected_workflow_id: tab
+                    .table_state
+                    .selected()
+                    .and_then(|index| self.visible_workflows_for(tab).get(index).copied())
+                    .map(|workflow| workflow.id),
+            })
+            .collect();
         let state = ViewState::new(
             self.repository.clone(),
             &self.workflows,
-            self.filter.clone(),
-            self.sort.clone(),
+            tabs,
+            self.active_tab,
         );
         match state.save(&path) {
             Ok(()) => {
@@ -516,8 +659,8 @@ impl App {
                 workflow_ids: Some(state.workflow_ids),
                 state_path: Some(path),
                 kind: LoadKind::Edit,
-                filter: state.filter,
-                sort: state.sort,
+                tabs: Some(state.tabs),
+                active_tab: state.active_tab,
             }),
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
@@ -544,8 +687,8 @@ impl App {
 
     fn set_filter(&mut self, argument: Option<&str>) {
         let Some(expression) = argument.filter(|argument| !argument.is_empty()) else {
-            self.filter = None;
-            self.filter_expression = None;
+            self.active_tab_mut().filter = None;
+            self.active_tab_mut().filter_expression = None;
             self.reset_visible_selection();
             self.message = Some("Filter cleared".to_owned());
             return;
@@ -553,8 +696,8 @@ impl App {
 
         match FilterExpression::parse(expression) {
             Ok(filter) => {
-                self.filter = Some(expression.to_owned());
-                self.filter_expression = Some(filter);
+                self.active_tab_mut().filter = Some(expression.to_owned());
+                self.active_tab_mut().filter_expression = Some(filter);
                 self.reset_visible_selection();
                 self.message = Some(format!("Filter: {expression}"));
             }
@@ -564,8 +707,8 @@ impl App {
 
     fn set_sort(&mut self, argument: Option<&str>) {
         let Some(specification) = argument.filter(|argument| !argument.is_empty()) else {
-            self.sort = None;
-            self.sort_spec = None;
+            self.active_tab_mut().sort = None;
+            self.active_tab_mut().sort_spec = None;
             self.reset_visible_selection();
             self.message = Some("Sort cleared".to_owned());
             return;
@@ -573,8 +716,8 @@ impl App {
 
         match SortSpec::parse(specification) {
             Ok(sort) => {
-                self.sort = Some(specification.to_owned());
-                self.sort_spec = Some(sort);
+                self.active_tab_mut().sort = Some(specification.to_owned());
+                self.active_tab_mut().sort_spec = Some(sort);
                 self.reset_visible_selection();
                 self.message = Some(format!("Sort: {specification}"));
             }
@@ -583,8 +726,60 @@ impl App {
     }
 
     fn reset_visible_selection(&mut self) {
-        self.table_state
-            .select((!self.visible_workflows().is_empty()).then_some(0));
+        let has_visible = !self.visible_workflows().is_empty();
+        self.active_tab_mut()
+            .table_state
+            .select(has_visible.then_some(0));
+    }
+
+    fn tab_new(&mut self, name: Option<&str>) {
+        let mut tab = self.active_tab().clone();
+        tab.name = name.filter(|name| !name.is_empty()).map(ToOwned::to_owned);
+        self.tabs.insert(self.active_tab + 1, tab);
+        self.active_tab += 1;
+        self.message = Some(format!("{} opened", self.active_tab_label()));
+    }
+
+    fn tab_set_name(&mut self, name: Option<&str>) {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            self.message = Some("E471: Argument required".to_owned());
+            return;
+        };
+
+        self.active_tab_mut().name = Some(name.to_owned());
+        self.message = Some(format!("Tab renamed to {name}"));
+    }
+
+    fn tab_next(&mut self) {
+        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        self.message = Some(format!("Tab {}", self.active_tab + 1));
+    }
+
+    fn tab_previous(&mut self) {
+        self.active_tab = self
+            .active_tab
+            .checked_sub(1)
+            .unwrap_or(self.tabs.len() - 1);
+        self.message = Some(format!("Tab {}", self.active_tab + 1));
+    }
+
+    fn tab_close(&mut self) {
+        if self.tabs.len() == 1 {
+            self.tabs[0] = Tab::new(None, Vec::new(), None, None);
+            self.message = Some("Last tab reset".to_owned());
+            return;
+        }
+
+        self.tabs.remove(self.active_tab);
+        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        self.message = Some(format!("Tab {} closed", self.active_tab + 1));
+    }
+
+    fn active_tab_label(&self) -> String {
+        self.active_tab()
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Tab {}", self.active_tab + 1))
     }
 
     fn backspace_command(&mut self) {
@@ -649,8 +844,9 @@ impl App {
             return;
         }
 
-        let current = self.table_state.selected().unwrap_or(0);
-        self.table_state
+        let current = self.active_tab().table_state.selected().unwrap_or(0);
+        self.active_tab_mut()
+            .table_state
             .select(Some((current + amount).min(visible_count - 1)));
     }
 
@@ -659,27 +855,67 @@ impl App {
             return;
         }
 
-        let current = self.table_state.selected().unwrap_or(0);
-        self.table_state
+        let current = self.active_tab().table_state.selected().unwrap_or(0);
+        self.active_tab_mut()
+            .table_state
             .select(Some(current.saturating_sub(amount)));
     }
 
     fn select_first(&mut self) {
         if !self.visible_workflows().is_empty() {
-            self.table_state.select(Some(0));
+            self.active_tab_mut().table_state.select(Some(0));
         }
     }
 
     fn select_last(&mut self) {
         let visible_count = self.visible_workflows().len();
         if visible_count > 0 {
-            self.table_state.select(Some(visible_count - 1));
+            self.active_tab_mut()
+                .table_state
+                .select(Some(visible_count - 1));
         }
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let [table_area, help_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
+        let (tabs_area, table_area, help_area) = if self.tabs.is_empty() {
+            let [table_area, help_area] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
+            (None, table_area, help_area)
+        } else {
+            let [tabs_area, table_area, help_area] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .areas(frame.area());
+            (Some(tabs_area), table_area, help_area)
+        };
+
+        if let Some(tabs_area) = tabs_area {
+            let tab_titles = (0..self.tabs.len())
+                .map(|index| {
+                    Line::from(format!(
+                        " {} ",
+                        self.tabs[index]
+                            .name
+                            .as_deref()
+                            .map_or_else(|| format!("Tab {}", index + 1), ToOwned::to_owned)
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let tabs = Tabs::new(tab_titles)
+                .select(self.active_tab)
+                .style(Style::default().fg(Color::White).bg(Color::DarkGray))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .divider(" ");
+            frame.render_widget(tabs, tabs_area);
+        }
+
         let visible_workflows = self
             .visible_workflows()
             .into_iter()
@@ -689,7 +925,11 @@ impl App {
         if visible_workflows.is_empty() {
             let empty_message = if self.is_loading() {
                 "Loading GitHub Actions workflows..."
-            } else if self.filter.is_some() {
+            } else if self
+                .tabs
+                .get(self.active_tab)
+                .is_some_and(|tab| tab.filter.is_some())
+            {
                 "No workflows match the active filter."
             } else {
                 "This repository has no active GitHub Actions workflows."
@@ -741,7 +981,8 @@ impl App {
                 visible_workflows.len()
             )));
 
-            frame.render_stateful_widget(table, table_area, &mut self.table_state);
+            let active_tab = self.active_tab;
+            frame.render_stateful_widget(table, table_area, &mut self.tabs[active_tab].table_state);
         }
 
         match self.mode {
@@ -846,8 +1087,8 @@ fn char_to_byte_index(value: &str, character_index: usize) -> usize {
 pub fn run(
     repository: Repository,
     workflow_ids: Option<Vec<u64>>,
-    filter: Option<String>,
-    sort: Option<String>,
+    tabs: Option<Vec<ViewTab>>,
+    active_tab: usize,
     state_path: Option<PathBuf>,
     workflow_source: Arc<dyn WorkflowSource>,
 ) -> io::Result<()> {
@@ -858,8 +1099,8 @@ pub fn run(
         workflow_ids,
         state_path,
         workflow_source,
-        filter,
-        sort,
+        tabs,
+        active_tab,
     )
     .run(&mut terminal);
     ratatui::restore();
@@ -922,7 +1163,6 @@ mod tests {
             None,
             Arc::new(TestWorkflowSource),
             None,
-            None,
         )
     }
 
@@ -950,12 +1190,12 @@ mod tests {
 
     #[test]
     fn new_selects_first_workflow() {
-        assert_eq!(app(2).table_state.selected(), Some(0));
+        assert_eq!(app(2).active_tab().table_state.selected(), Some(0));
     }
 
     #[test]
     fn new_leaves_selection_empty_without_workflows() {
-        assert_eq!(app(0).table_state.selected(), None);
+        assert_eq!(app(0).active_tab().table_state.selected(), None);
     }
 
     #[test]
@@ -966,7 +1206,7 @@ mod tests {
             None,
             Arc::new(TestWorkflowSource),
             None,
-            None,
+            0,
         );
 
         assert!(app.is_loading());
@@ -984,7 +1224,7 @@ mod tests {
 
         assert!(!app.is_loading());
         assert_eq!(app.workflows.len(), 100);
-        assert_eq!(app.table_state.selected(), Some(0));
+        assert_eq!(app.active_tab().table_state.selected(), Some(0));
     }
 
     #[test]
@@ -995,7 +1235,7 @@ mod tests {
             Some(PathBuf::from("saved-view.json")),
             Arc::new(TestWorkflowSource),
             None,
-            None,
+            0,
         );
 
         complete_loading(&mut app);
@@ -1020,7 +1260,7 @@ mod tests {
         complete_loading(&mut app);
 
         assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
-        assert_eq!(app.table_state.selected(), Some(1));
+        assert_eq!(app.active_tab().table_state.selected(), Some(1));
         assert_eq!(app.message.as_deref(), Some("2 workflows refreshed"));
     }
 
@@ -1077,16 +1317,16 @@ mod tests {
         let mut app = app(20);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
-        assert_eq!(app.table_state.selected(), Some(19));
+        assert_eq!(app.active_tab().table_state.selected(), Some(19));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(app.table_state.selected(), Some(19));
+        assert_eq!(app.active_tab().table_state.selected(), Some(19));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(app.table_state.selected(), Some(9));
+        assert_eq!(app.active_tab().table_state.selected(), Some(9));
 
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.table_state.selected(), Some(0));
+        assert_eq!(app.active_tab().table_state.selected(), Some(0));
     }
 
     #[test]
@@ -1097,7 +1337,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
 
-        assert_eq!(app.table_state.selected(), Some(0));
+        assert_eq!(app.active_tab().table_state.selected(), Some(0));
     }
 
     #[test]
@@ -1207,7 +1447,7 @@ mod tests {
         enter_command(&mut app, "filter name:Workflow*");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.visible_workflows().len(), 3);
-        assert_eq!(app.filter.as_deref(), Some("name:Workflow*"));
+        assert_eq!(app.active_tab().filter.as_deref(), Some("name:Workflow*"));
 
         enter_command(&mut app, "filter name:Workflow\\ 1");
         app.handle_key(key(KeyCode::Enter));
@@ -1217,7 +1457,7 @@ mod tests {
         enter_command(&mut app, "filter");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.visible_workflows().len(), 3);
-        assert!(app.filter.is_none());
+        assert!(app.active_tab().filter.is_none());
     }
 
     #[test]
@@ -1241,7 +1481,7 @@ mod tests {
         enter_command(&mut app, "sort");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.visible_workflows()[0].id, 0);
-        assert!(app.sort.is_none());
+        assert!(app.active_tab().sort.is_none());
     }
 
     #[test]
@@ -1250,7 +1490,7 @@ mod tests {
 
         enter_command(&mut app, "filter name:\"unterminated");
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.filter.is_none());
+        assert!(app.active_tab().filter.is_none());
         assert!(
             app.message
                 .as_deref()
@@ -1260,7 +1500,7 @@ mod tests {
 
         enter_command(&mut app, "sort name:sideways");
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.sort.is_none());
+        assert!(app.active_tab().sort.is_none());
         assert!(
             app.message
                 .as_deref()
@@ -1296,9 +1536,9 @@ mod tests {
         assert_eq!(app.workflows.len(), 2);
         assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
         assert_eq!(app.workflows[0].run_status, RunStatus::Success);
-        assert_eq!(app.filter.as_deref(), Some("status:success"));
-        assert_eq!(app.sort.as_deref(), Some("name:desc"));
-        assert_eq!(app.table_state.selected(), Some(0));
+        assert_eq!(app.active_tab().filter.as_deref(), Some("status:success"));
+        assert_eq!(app.active_tab().sort.as_deref(), Some("name:desc"));
+        assert_eq!(app.active_tab().table_state.selected(), Some(0));
     }
 
     #[test]
@@ -1342,6 +1582,30 @@ mod tests {
     }
 
     #[test]
+    fn write_state_persists_all_tabs_and_active_selection() {
+        let path =
+            std::env::temp_dir().join(format!("gh-actui-tabs-state-{}.json", std::process::id()));
+        let mut app = app(3);
+        app.select_next(1);
+        enter_command(&mut app, "tabnew Failures");
+        app.handle_key(key(KeyCode::Enter));
+        enter_command(&mut app, "filter name:Workflow\\ 2");
+        app.handle_key(key(KeyCode::Enter));
+        enter_command(&mut app, &format!("w {}", path.display()));
+        app.handle_key(key(KeyCode::Enter));
+
+        let saved = ViewState::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(saved.active_tab, 1);
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.tabs[0].selected_workflow_id, Some(1));
+        assert_eq!(saved.tabs[1].name.as_deref(), Some("Failures"));
+        assert_eq!(saved.tabs[1].filter.as_deref(), Some("name:Workflow\\ 2"));
+        assert_eq!(saved.tabs[1].selected_workflow_id, Some(2));
+    }
+
+    #[test]
     fn delete_command_removes_selected_workflow() {
         let mut app = app(3);
         app.select_next(1);
@@ -1349,9 +1613,10 @@ mod tests {
         enter_command(&mut app, "d");
         app.handle_key(key(KeyCode::Enter));
 
-        let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
+        let ids = app.active_tab().workflow_ids.clone();
         assert_eq!(ids, vec![0, 2]);
-        assert_eq!(app.table_state.selected(), Some(1));
+        assert_eq!(app.workflows.len(), 3);
+        assert_eq!(app.active_tab().table_state.selected(), Some(1));
         assert_eq!(app.message.as_deref(), Some("1 workflow deleted"));
     }
 
@@ -1363,9 +1628,10 @@ mod tests {
         enter_command(&mut app, "d3");
         app.handle_key(key(KeyCode::Enter));
 
-        let ids: Vec<_> = app.workflows.iter().map(|workflow| workflow.id).collect();
+        let ids = app.active_tab().workflow_ids.clone();
         assert_eq!(ids, vec![0, 1, 2]);
-        assert_eq!(app.table_state.selected(), Some(2));
+        assert_eq!(app.workflows.len(), 5);
+        assert_eq!(app.active_tab().table_state.selected(), Some(2));
         assert_eq!(app.message.as_deref(), Some("2 workflows deleted"));
     }
 
@@ -1380,11 +1646,7 @@ mod tests {
         enter_command(&mut app, "d2");
         app.handle_key(key(KeyCode::Enter));
 
-        let ids = app
-            .workflows
-            .iter()
-            .map(|workflow| workflow.id)
-            .collect::<Vec<_>>();
+        let ids = app.active_tab().workflow_ids.clone();
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(app.visible_workflows()[0].id, 1);
     }
@@ -1396,8 +1658,9 @@ mod tests {
         enter_command(&mut app, "d2");
         app.handle_key(key(KeyCode::Enter));
 
-        assert!(app.workflows.is_empty());
-        assert_eq!(app.table_state.selected(), None);
+        assert!(app.active_tab().workflow_ids.is_empty());
+        assert_eq!(app.workflows.len(), 2);
+        assert_eq!(app.active_tab().table_state.selected(), None);
     }
 
     #[test]
@@ -1419,6 +1682,123 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(app.message.as_deref(), Some("E749: Empty buffer"));
+    }
+
+    #[test]
+    fn tabnew_duplicates_active_view_without_duplicating_workflows() {
+        let mut app = app(3);
+        app.select_next(1);
+        enter_command(&mut app, "filter -name:Workflow\\ 0");
+        app.handle_key(key(KeyCode::Enter));
+        enter_command(&mut app, "sort name:desc");
+        app.handle_key(key(KeyCode::Enter));
+
+        enter_command(&mut app, "tabnew");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.workflows.len(), 3);
+        assert_eq!(app.tabs[0].workflow_ids, app.tabs[1].workflow_ids);
+        assert_eq!(app.tabs[1].filter.as_deref(), Some("-name:Workflow\\ 0"));
+        assert_eq!(app.tabs[1].sort.as_deref(), Some("name:desc"));
+
+        enter_command(&mut app, "d");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tabs[0].workflow_ids, vec![0, 1, 2]);
+        assert_eq!(app.tabs[1].workflow_ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn tab_commands_and_shortcuts_wrap_between_tabs() {
+        let mut app = app(2);
+        for _ in 0..2 {
+            enter_command(&mut app, "tabnew");
+            app.handle_key(key(KeyCode::Enter));
+        }
+        assert_eq!(app.active_tab, 2);
+
+        enter_command(&mut app, "tabnext");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active_tab, 0);
+        enter_command(&mut app, "tabp");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active_tab, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab, 0);
+        app.handle_key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.active_tab, 2);
+
+        app.mode = Mode::Command;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.mode, Mode::Command);
+    }
+
+    #[test]
+    fn tabclose_closes_active_tab_and_resets_the_last_tab() {
+        let mut app = app(2);
+        enter_command(&mut app, "tabnew");
+        app.handle_key(key(KeyCode::Enter));
+
+        enter_command(&mut app, "tabc");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.active_tab().workflow_ids, vec![0, 1]);
+
+        enter_command(&mut app, "tabclose");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.active_tab().workflow_ids.is_empty());
+        assert!(app.workflows.len() == 2);
+    }
+
+    #[test]
+    fn tabnew_uses_optional_argument_as_tab_name() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "tabnew Weekly failures");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().name.as_deref(), Some("Weekly failures"));
+        assert_eq!(app.message.as_deref(), Some("Weekly failures opened"));
+    }
+
+    #[test]
+    fn tabsetname_renames_active_tab_with_full_argument() {
+        let mut app = app(1);
+        enter_command(&mut app, "tabnew Old name");
+        app.handle_key(key(KeyCode::Enter));
+
+        enter_command(&mut app, "tabsetname Weekly Linux failures");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.active_tab().name.as_deref(),
+            Some("Weekly Linux failures")
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Tab renamed to Weekly Linux failures")
+        );
+        assert!(app.tabs[0].name.is_none());
+    }
+
+    #[test]
+    fn tabsetname_requires_a_name() {
+        let mut app = app(1);
+
+        enter_command(&mut app, "tabsetname");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.active_tab().name.is_none());
+        assert_eq!(app.message.as_deref(), Some("E471: Argument required"));
     }
 
     #[test]

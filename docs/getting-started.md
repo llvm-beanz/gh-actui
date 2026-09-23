@@ -29,8 +29,9 @@ bottom status bar displays the repository being loaded until the data is
 ready. Current data refreshes automatically every 15 seconds; the interval is
 shown in the bottom bar and can be changed for the current session with
 `:refresh-rate N`.
-When a state file is supplied, the saved workflow IDs determine which
-workflows are displayed. Names, paths, workflow state, and run status are
+When a state file is supplied, its saved global workflow IDs and tab
+arrangement are restored. Each tab keeps its own name, workflow subset, filter,
+sort, and selection. Workflow names, paths, workflow state, and run status are
 queried again from GitHub.
 
 ## Build
