@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
+            extension: ""
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            platform: darwin-amd64
+            extension: ""
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            extension: ""
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-amd64
+            extension: ".exe"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Stage release binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp \
+            "target/${{ matrix.target }}/release/gh-actui${{ matrix.extension }}" \
+            "dist/gh-actui_${{ github.ref_name }}_${{ matrix.platform }}${{ matrix.extension }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gh-actui-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gh-actui-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare release script
+        run: chmod +x script/release-assets.sh
+      - uses: cli/gh-extension-precompile@v2
+        with:
+          build_script_override: script/release-assets.sh
+          generate_attestations: true
