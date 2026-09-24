@@ -39,16 +39,17 @@ GitHub's server-side `created` filter for workflow runs can return stale
 results for workflows with large run histories. `gh-actui` therefore fetches
 the unfiltered workflow-run endpoint in newest-first pages and applies the
 14-day cutoff locally. Pagination stops after passing that cutoff and finding
-the latest completed run.
+the latest completed run. Pull request runs are excluded from the request so
+that each page carries only the runs the tables report on.
 
 Workflow discovery and run-history enrichment load separately in the
 background. The workflow rows appear as soon as the repository's active
 workflow list is available; status and 24-hour, 7-day, and 14-day metrics then
 fill in incrementally as each workflow's run history finishes loading. Up to
-eight histories are queried concurrently. Run history is only fetched for the
+four histories are queried concurrently. Run history is only fetched for the
 workflows currently held by the view, so workflows removed with `:d` or
 excluded by a saved view are not re-queried, and the `(loaded/total)` progress
-counter is measured against that same set. Refreshes run every 15 seconds by
+counter is measured against that same set. Refreshes run every 60 seconds by
 default and retain the previous status and metrics until each updated result
 arrives; only workflows that have no data yet, such as ones discovered during
 that refresh, show `loading...` placeholders.
@@ -59,6 +60,31 @@ borderless bar occupies one terminal row. Messages and command input stay
 anchored at the left edge, while the refresh rate and the highlighted current
 mode or operation stay anchored at the right edge. The interface remains
 responsive during background work.
+
+## Run history cache
+
+Run history is cached on disk between sessions so that refreshes stay within
+GitHub's API rate limits. The cache is written after each load or refresh
+finishes and stores, per workflow, the runs inside the 14-day window plus the
+`ETag` returned for the newest page.
+
+On the next poll the stored `ETag` is sent as an `If-None-Match` header. When
+nothing has changed GitHub answers `304 Not Modified`, which returns no body
+and does not count against the primary rate limit, so an unchanged repository
+costs roughly one billed request per refresh instead of one per workflow. When
+the newest page has changed, paging stops as soon as a page reaches a run that
+is already cached, because pages arrive newest-first and every older run is
+therefore already known.
+
+The cache file is stored at:
+
+- `%LOCALAPPDATA%\gh-actui\run-cache.json` on Windows
+- `$XDG_CACHE_HOME/gh-actui/run-cache.json` when `XDG_CACHE_HOME` is set
+- `~/.cache/gh-actui/run-cache.json` otherwise
+
+Set `GH_ACTUI_CACHE` to use a different cache file. The cache is versioned; an
+unreadable, corrupt, or outdated file is ignored and rebuilt on the next load,
+so deleting it is always safe.
 
 ## Keyboard shortcuts
 

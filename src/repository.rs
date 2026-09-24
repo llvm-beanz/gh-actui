@@ -27,8 +27,10 @@ impl Repository {
     }
 
     pub fn workflow_runs_api_path(&self, workflow_id: u64) -> String {
+        // `exclude_pull_requests` drops a large, unused block of pull request
+        // data from every run, which keeps responses small and cheap.
         format!(
-            "repos/{}/{}/actions/workflows/{workflow_id}/runs?per_page=100",
+            "repos/{}/{}/actions/workflows/{workflow_id}/runs?per_page=100&exclude_pull_requests=true",
             self.owner, self.name,
         )
     }

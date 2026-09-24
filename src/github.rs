@@ -1,12 +1,17 @@
-use std::{process::Command, thread};
+use std::{collections::BTreeMap, process::Command, sync::Mutex, thread};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::repository::Repository;
+use crate::{
+    cache::{CachedRun, CachedWorkflowRuns, RunCache, run_cache_key, run_cache_path},
+    repository::Repository,
+};
 
-pub const MAX_CONCURRENT_REQUESTS: usize = 8;
+// GitHub's REST best practices advise against issuing many concurrent
+// requests, so keep the fan-out modest while still hiding request latency.
+pub const MAX_CONCURRENT_REQUESTS: usize = 4;
 const RUNS_PER_PAGE: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -74,6 +79,18 @@ struct WorkflowRun {
     created_at: DateTime<Utc>,
 }
 
+impl From<WorkflowRun> for CachedRun {
+    fn from(run: WorkflowRun) -> Self {
+        Self {
+            id: run.id,
+            status: run.status,
+            conclusion: run.conclusion,
+            event: run.event,
+            created_at: run.created_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowTriage {
     pub workflow_id: u64,
@@ -110,6 +127,8 @@ pub enum Error {
     Start(#[source] std::io::Error),
     #[error("GitHub CLI request failed: {0}")]
     Request(String),
+    #[error("GitHub API rate limit reached{0}")]
+    RateLimited(String),
     #[error("GitHub CLI returned invalid Actions data: {0}")]
     InvalidResponse(#[from] serde_json::Error),
     #[error("a workflow status worker stopped unexpectedly")]
@@ -130,9 +149,30 @@ pub trait WorkflowSource: Send + Sync {
         repository: &Repository,
         workflows: &[Workflow],
     ) -> Result<Vec<WorkflowTriage>, Error>;
+    /// Persist any cached data gathered during a load.
+    fn flush(&self) {}
 }
 
-pub struct GhWorkflowSource;
+pub struct GhWorkflowSource {
+    cache: Mutex<RunCache>,
+}
+
+impl Default for GhWorkflowSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GhWorkflowSource {
+    pub fn new() -> Self {
+        let cache = run_cache_path()
+            .map(|path| RunCache::load(&path).unwrap_or_default())
+            .unwrap_or_default();
+        Self {
+            cache: Mutex::new(cache),
+        }
+    }
+}
 
 impl WorkflowSource for GhWorkflowSource {
     fn list_workflows(&self, repository: &Repository) -> Result<Vec<Workflow>, Error> {
@@ -148,7 +188,22 @@ impl WorkflowSource for GhWorkflowSource {
     ) -> Result<Workflow, Error> {
         let mut workflow = workflow.clone();
         let runs_path = repository.workflow_runs_api_path(workflow.id);
-        let summary = fetch_run_status(&runs_path, Utc::now())?;
+        let key = run_cache_key(&repository.to_string(), workflow.id);
+        let cached = self
+            .cache
+            .lock()
+            .map(|cache| cache.get(&key))
+            .unwrap_or_default();
+
+        let (summary, updated) =
+            fetch_run_status_with(&runs_path, Utc::now(), &cached, |path, etag| {
+                fetch_page_conditional(path, etag)
+            })?;
+
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(key, updated);
+        }
+
         workflow.run_status = summary.run_status;
         workflow.is_in_progress = summary.is_in_progress;
         workflow.run_metrics = summary.run_metrics;
@@ -175,6 +230,13 @@ impl WorkflowSource for GhWorkflowSource {
             triage.extend(results.into_iter().flatten());
         }
         Ok(triage)
+    }
+
+    fn flush(&self) {
+        let (Some(path), Ok(cache)) = (run_cache_path(), self.cache.lock()) else {
+            return;
+        };
+        let _ = cache.save(&path);
     }
 }
 
@@ -211,6 +273,110 @@ fn run_gh(arguments: &[&str]) -> Result<GhOutput, Error> {
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PageResponse {
+    NotModified,
+    Modified { body: Vec<u8>, etag: Option<String> },
+}
+
+/// Request a page of workflow runs, reusing a cached validator when present.
+///
+/// GitHub does not charge the primary rate limit for a conditional request
+/// that returns `304 Not Modified`, which makes this the cheapest way to poll
+/// unchanged history.
+fn fetch_page_conditional(path: &str, etag: Option<&str>) -> Result<PageResponse, Error> {
+    let header = etag.map(|etag| format!("If-None-Match: {etag}"));
+    let mut arguments = vec!["api", "-i", "-X", "GET", path];
+    if let Some(header) = header.as_deref() {
+        arguments.push("-H");
+        arguments.push(header);
+    }
+    parse_page_response(run_gh(&arguments)?)
+}
+
+fn parse_page_response(output: GhOutput) -> Result<PageResponse, Error> {
+    let (status_code, headers, body) = split_http_response(&output.stdout);
+    match status_code {
+        Some(304) => Ok(PageResponse::NotModified),
+        Some(code) if (200..300).contains(&code) => Ok(PageResponse::Modified {
+            body,
+            etag: header_value(&headers, "etag"),
+        }),
+        Some(code) if code == 403 || code == 429 => Err(rate_limit_error(&headers, &output)),
+        _ => Err(request_error(&output)),
+    }
+}
+
+fn rate_limit_error(headers: &BTreeMap<String, String>, output: &GhOutput) -> Error {
+    let remaining = header_value(headers, "x-ratelimit-remaining");
+    // A 403 that is not a rate limit (for example a permissions problem)
+    // should keep its original message.
+    if remaining.as_deref() != Some("0") {
+        let message = String::from_utf8_lossy(&output.stderr);
+        if !message.to_lowercase().contains("rate limit") {
+            return request_error(output);
+        }
+    }
+
+    let resource = header_value(headers, "x-ratelimit-resource")
+        .map(|resource| format!(" for {resource} requests"))
+        .unwrap_or_default();
+    let reset = header_value(headers, "retry-after")
+        .and_then(|seconds| seconds.trim().parse::<i64>().ok())
+        .map(|seconds| format!("; retry in {seconds}s"))
+        .or_else(|| {
+            let reset = header_value(headers, "x-ratelimit-reset")?
+                .trim()
+                .parse::<i64>()
+                .ok()?;
+            let reset = DateTime::from_timestamp(reset, 0)?;
+            let minutes = (reset - Utc::now()).num_minutes().max(0);
+            Some(format!("; resets in {minutes}m"))
+        })
+        .unwrap_or_default();
+    Error::RateLimited(format!("{resource}{reset}"))
+}
+
+fn request_error(output: &GhOutput) -> Error {
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Error::Request(if message.is_empty() {
+        format!("gh exited with status {}", output.status)
+    } else {
+        message
+    })
+}
+
+/// Split `gh api --include` output into a status code, headers, and body.
+fn split_http_response(stdout: &[u8]) -> (Option<u16>, BTreeMap<String, String>, Vec<u8>) {
+    let text = String::from_utf8_lossy(stdout);
+    let (head, body) = match text.find("\r\n\r\n") {
+        Some(index) => (&text[..index], &text[index + 4..]),
+        None => match text.find("\n\n") {
+            Some(index) => (&text[..index], &text[index + 2..]),
+            None => (text.as_ref(), ""),
+        },
+    };
+
+    let mut lines = head.lines();
+    let status_code = lines.next().and_then(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+    });
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_lowercase(), value.trim().to_owned()))
+        })
+        .collect();
+
+    (status_code, headers, body.as_bytes().to_vec())
+}
+
+fn header_value(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    headers.get(name).cloned()
+}
+
 fn parse_workflows(response: &[u8]) -> Result<Vec<Workflow>, Error> {
     let pages: Vec<WorkflowPage> = serde_json::from_slice(response)?;
     Ok(pages
@@ -220,19 +386,23 @@ fn parse_workflows(response: &[u8]) -> Result<Vec<Workflow>, Error> {
         .collect())
 }
 
-fn fetch_run_status(runs_path: &str, now: DateTime<Utc>) -> Result<RunSummary, Error> {
-    fetch_run_status_with(runs_path, now, |path| {
-        successful_stdout(run_gh(&["api", "-X", "GET", path])?)
-    })
-}
-
+/// Summarize a workflow's recent runs, paging only as far as the cache allows.
+///
+/// Pages are newest-first, so once a page contains nothing but runs already
+/// cached as completed there is no newer history left to discover and paging
+/// can stop. Runs that were still queued or in progress when cached are the
+/// exception: they may have finished since, so paging continues until it has
+/// covered them.
 fn fetch_run_status_with(
     runs_path: &str,
     now: DateTime<Utc>,
-    mut fetch_page: impl FnMut(&str) -> Result<Vec<u8>, Error>,
-) -> Result<RunSummary, Error> {
+    cached: &CachedWorkflowRuns,
+    mut fetch_page: impl FnMut(&str, Option<&str>) -> Result<PageResponse, Error>,
+) -> Result<(RunSummary, CachedWorkflowRuns), Error> {
     let cutoff = now - Duration::days(14);
-    let mut runs = Vec::new();
+    let oldest_unsettled = cached.oldest_unsettled();
+    let mut fetched: Vec<CachedRun> = Vec::new();
+    let mut etag = cached.etag.clone();
     let mut page_number = 1;
     let mut found_completed = false;
 
@@ -241,22 +411,95 @@ fn fetch_run_status_with(
         // results for workflows with large histories. Fetch the unfiltered,
         // newest-first stream and enforce the time window locally instead.
         let page_path = format!("{runs_path}&page={page_number}");
-        let page: WorkflowRunPage = serde_json::from_slice(&fetch_page(&page_path)?)?;
-        let page_len = page.workflow_runs.len();
-        let reached_cutoff = page.workflow_runs.iter().any(|run| run.created_at < cutoff);
-        found_completed |= page
+        let validator = (page_number == 1).then_some(etag.as_deref()).flatten();
+        let page = match fetch_page(&page_path, validator)? {
+            PageResponse::NotModified => {
+                // The first page is unchanged, so no run has started or
+                // finished since the last refresh and the cache still holds
+                // the complete picture.
+                let entry = prune_runs(cached.runs.clone(), cutoff, etag);
+                return Ok((summarize_runs(&entry.runs, now), entry));
+            }
+            PageResponse::Modified { body, etag: value } => {
+                if page_number == 1 {
+                    etag = value;
+                }
+                serde_json::from_slice::<WorkflowRunPage>(&body)?
+            }
+        };
+
+        let runs: Vec<CachedRun> = page
             .workflow_runs
+            .into_iter()
+            .map(CachedRun::from)
+            .collect();
+        let page_len = runs.len();
+        let reached_cutoff = runs.iter().any(|run| run.created_at < cutoff);
+        found_completed |= runs.iter().any(CachedRun::is_completed);
+        let covered_unsettled = runs
             .iter()
-            .any(|run| run.status.as_deref() == Some("completed"));
-        runs.extend(page.workflow_runs);
+            .map(|run| run.created_at)
+            .min()
+            .zip(oldest_unsettled)
+            .is_some_and(|(oldest_on_page, unsettled)| oldest_on_page <= unsettled);
+        let reached_known_history = page_len > 0
+            && runs
+                .iter()
+                .any(|run| run.id.is_some_and(|id| cached.contains(id)));
+
+        fetched.extend(runs);
 
         if page_len < RUNS_PER_PAGE || (reached_cutoff && found_completed) {
+            break;
+        }
+        // This page reached runs that are already cached, so every older run
+        // is cached as well and there is nothing new left to discover.
+        if reached_known_history && (oldest_unsettled.is_none() || covered_unsettled) {
             break;
         }
         page_number += 1;
     }
 
-    Ok(summarize_runs(runs, now))
+    let entry = prune_runs(merge_runs(cached.runs.clone(), fetched), cutoff, etag);
+    Ok((summarize_runs(&entry.runs, now), entry))
+}
+
+/// Combine cached runs with freshly fetched ones, preferring fresh data.
+fn merge_runs(cached: Vec<CachedRun>, fetched: Vec<CachedRun>) -> Vec<CachedRun> {
+    let mut merged: Vec<CachedRun> = Vec::with_capacity(cached.len() + fetched.len());
+    let mut seen = BTreeMap::new();
+    for run in fetched.into_iter().chain(cached) {
+        match run.id {
+            Some(id) => {
+                if seen.insert(id, ()).is_none() {
+                    merged.push(run);
+                }
+            }
+            // Runs without an identifier cannot be de-duplicated, so keep the
+            // freshly fetched copy only.
+            None => merged.push(run),
+        }
+    }
+    merged
+}
+
+fn prune_runs(
+    mut runs: Vec<CachedRun>,
+    cutoff: DateTime<Utc>,
+    etag: Option<String>,
+) -> CachedWorkflowRuns {
+    runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+    // Metrics only cover the last 14 days, but the status column reflects the
+    // most recent completed run even when it is older than that window, so
+    // that run has to survive pruning.
+    let newest_completed = runs.iter().position(CachedRun::is_completed);
+    let mut index = 0;
+    runs.retain(|run| {
+        let keep = run.created_at >= cutoff || Some(index) == newest_completed;
+        index += 1;
+        keep
+    });
+    CachedWorkflowRuns { etag, runs }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -266,7 +509,7 @@ struct RunSummary {
     run_metrics: RunMetrics,
 }
 
-fn summarize_runs(runs: Vec<WorkflowRun>, now: DateTime<Utc>) -> RunSummary {
+fn summarize_runs(runs: &[CachedRun], now: DateTime<Utc>) -> RunSummary {
     let mut summary = RunSummary::default();
     let mut found_completed = false;
     for run in runs {
@@ -632,8 +875,8 @@ mod tests {
         "2026-09-23T12:00:00Z".parse().unwrap()
     }
 
-    fn run(status: &str, conclusion: Option<&str>, age: Duration) -> WorkflowRun {
-        WorkflowRun {
+    fn run(status: &str, conclusion: Option<&str>, age: Duration) -> CachedRun {
+        CachedRun {
             id: None,
             status: Some(status.to_owned()),
             conclusion: conclusion.map(str::to_owned),
@@ -717,7 +960,7 @@ mod tests {
             run("completed", Some("failure"), Duration::hours(3)),
         ];
 
-        let summary = summarize_runs(runs, now());
+        let summary = summarize_runs(&runs, now());
 
         assert_eq!(summary.run_status, RunStatus::Success);
     }
@@ -729,7 +972,7 @@ mod tests {
             run("completed", Some("success"), Duration::hours(1)),
         ];
 
-        let summary = summarize_runs(runs, now());
+        let summary = summarize_runs(&runs, now());
 
         assert!(summary.is_in_progress);
         assert_eq!(summary.run_status, RunStatus::Success);
@@ -737,7 +980,7 @@ mod tests {
 
     #[test]
     fn summarize_runs_uses_other_without_completed_run() {
-        let summary = summarize_runs(vec![run("queued", None, Duration::minutes(5))], now());
+        let summary = summarize_runs(&[run("queued", None, Duration::minutes(5))], now());
 
         assert_eq!(summary.run_status, RunStatus::Other);
         assert!(!summary.is_in_progress);
@@ -753,7 +996,7 @@ mod tests {
             run("completed", Some("success"), Duration::days(15)),
         ];
 
-        let summary = summarize_runs(runs, now());
+        let summary = summarize_runs(&runs, now());
 
         assert_eq!(
             summary.run_metrics.last_24_hours,
@@ -803,12 +1046,16 @@ mod tests {
         ]);
         let mut requested_paths = Vec::new();
 
-        let summary = fetch_run_status_with(
+        let (summary, _) = fetch_run_status_with(
             "repos/owner/repo/actions/workflows/42/runs?per_page=100",
             now(),
-            |path| {
+            &CachedWorkflowRuns::default(),
+            |path, _| {
                 requested_paths.push(path.to_owned());
-                Ok(responses.pop_front().unwrap())
+                Ok(PageResponse::Modified {
+                    body: responses.pop_front().unwrap(),
+                    etag: None,
+                })
             },
         )
         .unwrap();
@@ -844,14 +1091,454 @@ mod tests {
         let response = serde_json::to_vec(&json!({"workflow_runs": runs})).unwrap();
         let mut request_count = 0;
 
-        let summary = fetch_run_status_with("runs?per_page=100", now(), |_| {
-            request_count += 1;
-            Ok(response.clone())
-        })
+        let (summary, _) = fetch_run_status_with(
+            "runs?per_page=100",
+            now(),
+            &CachedWorkflowRuns::default(),
+            |_, _| {
+                request_count += 1;
+                Ok(PageResponse::Modified {
+                    body: response.clone(),
+                    etag: None,
+                })
+            },
+        )
         .unwrap();
 
         assert_eq!(request_count, 1);
         assert_eq!(summary.run_metrics.last_14_days.total, 99);
+    }
+
+    #[test]
+    fn fetch_run_status_reuses_cache_when_first_page_is_unchanged() {
+        let cached = CachedWorkflowRuns {
+            etag: Some("W/\"abc\"".to_owned()),
+            runs: vec![
+                run("completed", Some("success"), Duration::hours(1)),
+                run("completed", Some("failure"), Duration::days(2)),
+            ],
+        };
+        let mut validators = Vec::new();
+
+        let (summary, updated) =
+            fetch_run_status_with("runs?per_page=100", now(), &cached, |_, etag| {
+                validators.push(etag.map(str::to_owned));
+                Ok(PageResponse::NotModified)
+            })
+            .unwrap();
+
+        assert_eq!(validators, [Some("W/\"abc\"".to_owned())]);
+        assert_eq!(summary.run_status, RunStatus::Success);
+        assert_eq!(summary.run_metrics.last_7_days.total, 2);
+        assert_eq!(updated.etag.as_deref(), Some("W/\"abc\""));
+    }
+
+    #[test]
+    fn persisted_cache_supplies_the_validator_for_the_next_process() {
+        let directory =
+            std::env::temp_dir().join(format!("gh-actui-validator-{}", std::process::id()));
+        let path = directory.join("run-cache.json");
+        let key = run_cache_key("owner/repository", 7);
+        let mut cache = RunCache::new();
+        cache.insert(
+            key.clone(),
+            CachedWorkflowRuns {
+                etag: Some("W/\"abc\"".to_owned()),
+                runs: vec![run("completed", Some("success"), Duration::hours(1))],
+            },
+        );
+        cache.save(&path).unwrap();
+
+        // A later process only ever sees the cache through the file, so the
+        // validator has to survive the full save/load round trip.
+        let reloaded = RunCache::load(&path).unwrap();
+        let cached = reloaded.get(&key);
+        let mut validators = Vec::new();
+        let (summary, _) = fetch_run_status_with("runs?per_page=100", now(), &cached, |_, etag| {
+            validators.push(etag.map(str::to_owned));
+            Ok(PageResponse::NotModified)
+        })
+        .unwrap();
+
+        assert_eq!(validators, [Some("W/\"abc\"".to_owned())]);
+        assert_eq!(summary.run_status, RunStatus::Success);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn fetch_run_status_stops_at_history_already_cached_as_completed() {
+        let cached_runs = (0..RUNS_PER_PAGE)
+            .map(|index| CachedRun {
+                id: Some(index as u64),
+                status: Some("completed".to_owned()),
+                conclusion: Some("success".to_owned()),
+                event: None,
+                created_at: now() - Duration::hours(index as i64 + 1),
+            })
+            .collect::<Vec<_>>();
+        let page = (0..RUNS_PER_PAGE)
+            .map(|index| {
+                json!({
+                    "id": index,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": (now() - Duration::hours(index as i64 + 1)).to_rfc3339()
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&json!({"workflow_runs": page})).unwrap();
+        let cached = CachedWorkflowRuns {
+            etag: Some("W/\"stale\"".to_owned()),
+            runs: cached_runs,
+        };
+        let mut request_count = 0;
+
+        let (summary, updated) =
+            fetch_run_status_with("runs?per_page=100", now(), &cached, |_, _| {
+                request_count += 1;
+                Ok(PageResponse::Modified {
+                    body: body.clone(),
+                    etag: Some("W/\"fresh\"".to_owned()),
+                })
+            })
+            .unwrap();
+
+        // A full page of runs already cached as completed means there is no
+        // newer history to discover, so paging stops immediately.
+        assert_eq!(request_count, 1);
+        assert_eq!(summary.run_metrics.last_14_days.total, RUNS_PER_PAGE as u32);
+        assert_eq!(updated.etag.as_deref(), Some("W/\"fresh\""));
+    }
+
+    #[test]
+    fn fetch_run_status_stops_once_a_page_reaches_known_runs() {
+        // A new run pushes older history down, but the rest of the page is
+        // already cached, so one request is enough.
+        let cached_runs = (1..RUNS_PER_PAGE)
+            .map(|index| CachedRun {
+                id: Some(index as u64),
+                status: Some("completed".to_owned()),
+                conclusion: Some("success".to_owned()),
+                event: None,
+                created_at: now() - Duration::hours(index as i64 + 1),
+            })
+            .collect::<Vec<_>>();
+        let mut page = vec![json!({
+            "id": 9_001,
+            "status": "completed",
+            "conclusion": "failure",
+            "created_at": (now() - Duration::minutes(2)).to_rfc3339()
+        })];
+        page.extend((1..RUNS_PER_PAGE).map(|index| {
+            json!({
+                "id": index,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": (now() - Duration::hours(index as i64 + 1)).to_rfc3339()
+            })
+        }));
+        let body = serde_json::to_vec(&json!({"workflow_runs": page})).unwrap();
+        let cached = CachedWorkflowRuns {
+            etag: None,
+            runs: cached_runs,
+        };
+        let mut request_count = 0;
+
+        let (summary, updated) =
+            fetch_run_status_with("runs?per_page=100", now(), &cached, |_, _| {
+                request_count += 1;
+                Ok(PageResponse::Modified {
+                    body: body.clone(),
+                    etag: None,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(request_count, 1);
+        assert_eq!(summary.run_status, RunStatus::Failure);
+        assert_eq!(updated.runs.len(), RUNS_PER_PAGE);
+        assert_eq!(updated.runs[0].id, Some(9_001));
+    }
+
+    #[test]
+    fn fetch_run_status_keeps_paging_past_cached_runs_that_were_unsettled() {
+        let cached = CachedWorkflowRuns {
+            etag: None,
+            runs: vec![
+                CachedRun {
+                    id: Some(1),
+                    status: Some("completed".to_owned()),
+                    conclusion: Some("success".to_owned()),
+                    event: None,
+                    created_at: now() - Duration::hours(1),
+                },
+                // Still running when it was cached, so a refresh must reach it
+                // again to notice that it finished.
+                CachedRun {
+                    id: Some(2),
+                    status: Some("in_progress".to_owned()),
+                    conclusion: None,
+                    event: None,
+                    created_at: now() - Duration::days(3),
+                },
+            ],
+        };
+        let first_page = (0..RUNS_PER_PAGE)
+            .map(|_| {
+                json!({
+                    "id": 1,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": (now() - Duration::hours(1)).to_rfc3339()
+                })
+            })
+            .collect::<Vec<_>>();
+        let second_page = json!([{
+            "id": 2,
+            "status": "completed",
+            "conclusion": "failure",
+            "created_at": (now() - Duration::days(3)).to_rfc3339()
+        }]);
+        let mut responses = VecDeque::from([
+            serde_json::to_vec(&json!({"workflow_runs": first_page})).unwrap(),
+            serde_json::to_vec(&json!({"workflow_runs": second_page})).unwrap(),
+        ]);
+        let mut request_count = 0;
+
+        let (_, updated) = fetch_run_status_with("runs?per_page=100", now(), &cached, |_, _| {
+            request_count += 1;
+            Ok(PageResponse::Modified {
+                body: responses.pop_front().unwrap(),
+                etag: None,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(request_count, 2);
+        let refreshed = updated.runs.iter().find(|run| run.id == Some(2)).unwrap();
+        assert_eq!(refreshed.status.as_deref(), Some("completed"));
+        assert_eq!(refreshed.conclusion.as_deref(), Some("failure"));
+    }
+
+    #[test]
+    fn fetch_run_status_merges_new_runs_ahead_of_cached_history() {
+        let cached = CachedWorkflowRuns {
+            etag: None,
+            runs: vec![CachedRun {
+                id: Some(1),
+                status: Some("completed".to_owned()),
+                conclusion: Some("success".to_owned()),
+                event: None,
+                created_at: now() - Duration::days(1),
+            }],
+        };
+        let page = json!([{
+            "id": 2,
+            "status": "completed",
+            "conclusion": "failure",
+            "created_at": (now() - Duration::minutes(5)).to_rfc3339()
+        }]);
+        let body = serde_json::to_vec(&json!({"workflow_runs": page})).unwrap();
+
+        let (summary, updated) =
+            fetch_run_status_with("runs?per_page=100", now(), &cached, |_, _| {
+                Ok(PageResponse::Modified {
+                    body: body.clone(),
+                    etag: None,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(updated.runs.len(), 2);
+        assert_eq!(updated.runs[0].id, Some(2));
+        assert_eq!(summary.run_status, RunStatus::Failure);
+        assert_eq!(summary.run_metrics.last_7_days.total, 2);
+    }
+
+    #[test]
+    fn fetch_run_status_keeps_newest_completed_run_older_than_the_metrics_window() {
+        // The status column shows the last completed run even when the only
+        // completed run predates the 14-day metrics window.
+        let cached = CachedWorkflowRuns {
+            etag: Some("W/\"abc\"".to_owned()),
+            runs: vec![
+                run("queued", None, Duration::hours(1)),
+                run("completed", Some("failure"), Duration::days(20)),
+                run("completed", Some("success"), Duration::days(30)),
+            ],
+        };
+
+        let (summary, updated) =
+            fetch_run_status_with("runs?per_page=100", now(), &cached, |_, _| {
+                Ok(PageResponse::NotModified)
+            })
+            .unwrap();
+
+        assert_eq!(summary.run_status, RunStatus::Failure);
+        assert_eq!(summary.run_metrics.last_14_days.total, 0);
+        assert_eq!(updated.runs.len(), 2);
+        assert!(
+            updated
+                .runs
+                .iter()
+                .all(|run| run.conclusion.as_deref() != Some("success"))
+        );
+    }
+
+    #[test]
+    fn fetch_run_status_drops_cached_runs_older_than_the_window() {
+        let cached = CachedWorkflowRuns {
+            etag: Some("W/\"abc\"".to_owned()),
+            runs: vec![
+                run("completed", Some("success"), Duration::hours(1)),
+                run("completed", Some("success"), Duration::days(20)),
+            ],
+        };
+
+        let (summary, updated) =
+            fetch_run_status_with("runs?per_page=100", now(), &cached, |_, _| {
+                Ok(PageResponse::NotModified)
+            })
+            .unwrap();
+
+        assert_eq!(updated.runs.len(), 1);
+        assert_eq!(summary.run_metrics.last_14_days.total, 1);
+    }
+
+    #[test]
+    fn fetch_run_status_only_sends_a_validator_for_the_first_page() {
+        let cached = CachedWorkflowRuns {
+            etag: Some("W/\"abc\"".to_owned()),
+            runs: Vec::new(),
+        };
+        let first_page = (0..RUNS_PER_PAGE)
+            .map(|_| {
+                json!({
+                    "status": "queued",
+                    "conclusion": null,
+                    "created_at": (now() - Duration::hours(1)).to_rfc3339()
+                })
+            })
+            .collect::<Vec<_>>();
+        let second_page = json!([{
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": (now() - Duration::days(20)).to_rfc3339()
+        }]);
+        let mut responses = VecDeque::from([
+            serde_json::to_vec(&json!({"workflow_runs": first_page})).unwrap(),
+            serde_json::to_vec(&json!({"workflow_runs": second_page})).unwrap(),
+        ]);
+        let mut validators = Vec::new();
+
+        fetch_run_status_with("runs?per_page=100", now(), &cached, |_, etag| {
+            validators.push(etag.map(str::to_owned));
+            Ok(PageResponse::Modified {
+                body: responses.pop_front().unwrap(),
+                etag: None,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(validators, [Some("W/\"abc\"".to_owned()), None]);
+    }
+
+    #[test]
+    fn split_http_response_separates_status_headers_and_body() {
+        let raw =
+            b"HTTP/2.0 200 OK\r\nETag: W/\"abc\"\r\nX-RateLimit-Remaining: 42\r\n\r\n{\"ok\":true}";
+
+        let (status, headers, body) = split_http_response(raw);
+
+        assert_eq!(status, Some(200));
+        assert_eq!(header_value(&headers, "etag").as_deref(), Some("W/\"abc\""));
+        assert_eq!(
+            header_value(&headers, "x-ratelimit-remaining").as_deref(),
+            Some("42")
+        );
+        assert_eq!(body, b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn split_http_response_handles_newline_only_separators() {
+        let raw = b"HTTP/1.1 304 Not Modified\nETag: W/\"abc\"\n\n";
+
+        let (status, headers, _) = split_http_response(raw);
+
+        assert_eq!(status, Some(304));
+        assert_eq!(header_value(&headers, "etag").as_deref(), Some("W/\"abc\""));
+    }
+
+    #[test]
+    fn parse_page_response_reports_not_modified_even_though_gh_exits_nonzero() {
+        // `gh api` treats 304 as a failure, but for a conditional request it
+        // means the cached copy is still current.
+        let output = GhOutput {
+            success: false,
+            status: "exit code: 1".to_owned(),
+            stdout: b"HTTP/2.0 304 Not Modified\r\nETag: W/\"abc\"\r\n\r\n".to_vec(),
+            stderr: b"gh: HTTP 304".to_vec(),
+        };
+
+        assert_eq!(
+            parse_page_response(output).unwrap(),
+            PageResponse::NotModified
+        );
+    }
+
+    #[test]
+    fn parse_page_response_reports_rate_limit_with_reset_guidance() {
+        let reset = (now() + Duration::minutes(30)).timestamp();
+        let output = GhOutput {
+            success: false,
+            status: "exit code: 1".to_owned(),
+            stdout: format!(
+                "HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{}}"
+            )
+            .into_bytes(),
+            stderr: b"gh: API rate limit exceeded for user ID 1 (HTTP 403)".to_vec(),
+        };
+
+        let error = parse_page_response(output).unwrap_err();
+
+        let Error::RateLimited(detail) = error else {
+            panic!("expected a rate limit error, got {error:?}");
+        };
+        assert!(detail.contains("for core requests"), "{detail}");
+    }
+
+    #[test]
+    fn parse_page_response_keeps_non_rate_limited_forbidden_errors() {
+        let output = GhOutput {
+            success: false,
+            status: "exit code: 1".to_owned(),
+            stdout: b"HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 4999\r\n\r\n{}".to_vec(),
+            stderr: b"gh: Resource not accessible by integration (HTTP 403)".to_vec(),
+        };
+
+        let error = parse_page_response(output).unwrap_err();
+
+        assert!(
+            matches!(error, Error::Request(message) if message.contains("not accessible")),
+            "unexpected error variant"
+        );
+    }
+
+    #[test]
+    fn parse_page_response_prefers_retry_after_header() {
+        let output = GhOutput {
+            success: false,
+            status: "exit code: 1".to_owned(),
+            stdout: b"HTTP/2.0 429 Too Many Requests\r\nRetry-After: 45\r\nX-RateLimit-Remaining: 0\r\n\r\n{}".to_vec(),
+            stderr: b"gh: You have exceeded a secondary rate limit (HTTP 429)".to_vec(),
+        };
+
+        let error = parse_page_response(output).unwrap_err();
+
+        let Error::RateLimited(detail) = error else {
+            panic!("expected a rate limit error, got {error:?}");
+        };
+        assert!(detail.contains("retry in 45s"), "{detail}");
     }
 
     #[test]

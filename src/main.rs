@@ -1,3 +1,4 @@
+mod cache;
 mod github;
 mod query;
 mod repository;
@@ -32,7 +33,7 @@ enum Error {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse(), Arc::new(GhWorkflowSource)) {
+    match run(Cli::parse(), Arc::new(GhWorkflowSource::new())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");

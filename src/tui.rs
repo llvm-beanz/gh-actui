@@ -381,6 +381,7 @@ impl App {
                 });
             }
             let _ = sender.send(LoadEvent::Complete);
+            source.flush();
         });
         self.load_receiver = Some(receiver);
         self.pending_load = Some(pending);
