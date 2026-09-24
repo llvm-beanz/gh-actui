@@ -28,7 +28,7 @@ command to discover active GitHub Actions workflows in the background. The
 workflow rows appear as soon as discovery completes. Status and 24-hour,
 7-day, and 14-day metrics fill in incrementally, with up to eight workflow
 histories queried concurrently. The bottom status bar displays progress while
-that enrichment is running. Current data refreshes automatically every 15
+that enrichment is running. Current data refreshes automatically every 60
 seconds; the interval is shown in the bottom bar and can be changed for the
 current session with `:refresh-rate N`.
 When a state file is supplied, its saved global workflow IDs and tab

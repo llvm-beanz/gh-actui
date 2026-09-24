@@ -37,7 +37,7 @@ use crate::{
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_FLASH_INTERVAL: Duration = Duration::from_millis(500);
-const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SPLIT_RATIO_SCALE: u16 = 1000;
 const MIN_VIEW_HEIGHT: u16 = 5;
 const MIN_VIEW_WIDTH: u16 = 20;
@@ -353,13 +353,13 @@ impl App {
             {
                 return;
             }
-            let _ = &wanted_ids;
-            let targets: Vec<Workflow> = workflows;
-            {
-                let _unused = |wanted_ids: BTreeSet<u64>, workflow: &Workflow| {
-                    wanted_ids.contains(&workflow.id)
-                };
-            }
+            let targets: Vec<Workflow> = match wanted_ids {
+                Some(wanted_ids) => workflows
+                    .into_iter()
+                    .filter(|workflow| wanted_ids.contains(&workflow.id))
+                    .collect(),
+                None => workflows,
+            };
             for chunk in targets.chunks(MAX_CONCURRENT_REQUESTS) {
                 thread::scope(|scope| {
                     for workflow in chunk {

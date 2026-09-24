@@ -45,7 +45,10 @@ Workflow discovery and run-history enrichment load separately in the
 background. The workflow rows appear as soon as the repository's active
 workflow list is available; status and 24-hour, 7-day, and 14-day metrics then
 fill in incrementally as each workflow's run history finishes loading. Up to
-eight histories are queried concurrently. Refreshes run every 15 seconds by
+eight histories are queried concurrently. Run history is only fetched for the
+workflows currently held by the view, so workflows removed with `:d` or
+excluded by a saved view are not re-queried, and the `(loaded/total)` progress
+counter is measured against that same set. Refreshes run every 15 seconds by
 default and retain the previous status and metrics until each updated result
 arrives; only workflows that have no data yet, such as ones discovered during
 that refresh, show `loading...` placeholders.
