@@ -41,13 +41,21 @@ the unfiltered workflow-run endpoint in newest-first pages and applies the
 14-day cutoff locally. Pagination stops after passing that cutoff and finding
 the latest completed run.
 
-Workflow and run data load in the background and refresh every 15 seconds by
-default. The bottom bar always displays the configured refresh rate. While
-loading or refreshing, it replaces the normal keybinding summary with the
-current operation. The borderless bar occupies one terminal row. Messages and
-command input stay anchored at the left edge, while the refresh rate and the
-highlighted current mode or operation stay anchored at the right edge. The
-interface remains responsive during background work.
+Workflow discovery and run-history enrichment load separately in the
+background. The workflow rows appear as soon as the repository's active
+workflow list is available; status and 24-hour, 7-day, and 14-day metrics then
+fill in incrementally as each workflow's run history finishes loading. Up to
+eight histories are queried concurrently. Refreshes run every 15 seconds by
+default and retain the previous status and metrics until each updated result
+arrives; only workflows that have no data yet, such as ones discovered during
+that refresh, show `loading...` placeholders.
+
+The bottom bar always displays the configured refresh rate. While loading or
+refreshing, it shows the current operation and run-status progress. The
+borderless bar occupies one terminal row. Messages and command input stay
+anchored at the left edge, while the refresh rate and the highlighted current
+mode or operation stay anchored at the right edge. The interface remains
+responsive during background work.
 
 ## Keyboard shortcuts
 

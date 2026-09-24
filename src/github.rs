@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::repository::Repository;
 
-const MAX_CONCURRENT_REQUESTS: usize = 8;
+pub const MAX_CONCURRENT_REQUESTS: usize = 8;
 const RUNS_PER_PAGE: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -118,6 +118,13 @@ pub enum Error {
 
 pub trait WorkflowSource: Send + Sync {
     fn list_workflows(&self, repository: &Repository) -> Result<Vec<Workflow>, Error>;
+    fn load_workflow_status(
+        &self,
+        _repository: &Repository,
+        workflow: &Workflow,
+    ) -> Result<Workflow, Error> {
+        Ok(workflow.clone())
+    }
     fn triage_workflows(
         &self,
         repository: &Repository,
@@ -131,11 +138,21 @@ impl WorkflowSource for GhWorkflowSource {
     fn list_workflows(&self, repository: &Repository) -> Result<Vec<Workflow>, Error> {
         let workflows_path = repository.workflows_api_path();
         let workflow_output = run_gh(&["api", "--paginate", "--slurp", &workflows_path])?;
-        let mut workflows = parse_workflows(&successful_stdout(workflow_output)?)?;
+        parse_workflows(&successful_stdout(workflow_output)?)
+    }
 
-        load_run_statuses(repository, &mut workflows, Utc::now())?;
-
-        Ok(workflows)
+    fn load_workflow_status(
+        &self,
+        repository: &Repository,
+        workflow: &Workflow,
+    ) -> Result<Workflow, Error> {
+        let mut workflow = workflow.clone();
+        let runs_path = repository.workflow_runs_api_path(workflow.id);
+        let summary = fetch_run_status(&runs_path, Utc::now())?;
+        workflow.run_status = summary.run_status;
+        workflow.is_in_progress = summary.is_in_progress;
+        workflow.run_metrics = summary.run_metrics;
+        Ok(workflow)
     }
 
     fn triage_workflows(
@@ -201,37 +218,6 @@ fn parse_workflows(response: &[u8]) -> Result<Vec<Workflow>, Error> {
         .flat_map(|page| page.workflows)
         .filter(|workflow| workflow.state == "active")
         .collect())
-}
-
-fn load_run_statuses(
-    repository: &Repository,
-    workflows: &mut [Workflow],
-    now: DateTime<Utc>,
-) -> Result<(), Error> {
-    for chunk in workflows.chunks_mut(MAX_CONCURRENT_REQUESTS) {
-        let summaries = thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|workflow| {
-                    let runs_path = repository.workflow_runs_api_path(workflow.id);
-                    scope.spawn(move || fetch_run_status(&runs_path, now))
-                })
-                .collect();
-
-            handles
-                .into_iter()
-                .map(|handle| handle.join().map_err(|_| Error::StatusWorker)?)
-                .collect::<Result<Vec<_>, Error>>()
-        })?;
-
-        for (workflow, summary) in chunk.iter_mut().zip(summaries) {
-            workflow.run_status = summary.run_status;
-            workflow.is_in_progress = summary.is_in_progress;
-            workflow.run_metrics = summary.run_metrics;
-        }
-    }
-
-    Ok(())
 }
 
 fn fetch_run_status(runs_path: &str, now: DateTime<Utc>) -> Result<RunSummary, Error> {

@@ -27,7 +27,9 @@ use ratatui::{
 };
 
 use crate::{
-    github::{RunCounts, RunStatus, Workflow, WorkflowSource, WorkflowTriage},
+    github::{
+        MAX_CONCURRENT_REQUESTS, RunCounts, RunStatus, Workflow, WorkflowSource, WorkflowTriage,
+    },
     query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
     state::{EQUAL_SPLIT_RATIO, SplitDirection, ViewLayout, ViewPane, ViewState, ViewTab},
@@ -75,6 +77,18 @@ struct PendingLoad {
     kind: LoadKind,
     tabs: Option<Vec<ViewTab>>,
     active_tab: usize,
+}
+
+enum LoadEvent {
+    Discovered(Vec<Workflow>),
+    WorkflowLoaded(Workflow),
+    WorkflowFailed {
+        id: u64,
+        name: String,
+        error: String,
+    },
+    Fatal(String),
+    Complete,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,8 +204,11 @@ struct App {
     workflows: Vec<Workflow>,
     state_path: Option<PathBuf>,
     workflow_source: Arc<dyn WorkflowSource>,
-    load_receiver: Option<Receiver<Result<Vec<Workflow>, crate::github::Error>>>,
+    load_receiver: Option<Receiver<LoadEvent>>,
     pending_load: Option<PendingLoad>,
+    load_failures: Vec<String>,
+    loaded_status_count: usize,
+    loading_status_ids: BTreeSet<u64>,
     triage_receiver: Option<Receiver<Result<Vec<WorkflowTriage>, crate::github::Error>>>,
     triage_target: Option<TriageTarget>,
     triage: HashMap<u64, WorkflowTriage>,
@@ -247,6 +264,9 @@ impl App {
             workflow_source,
             load_receiver: None,
             pending_load: None,
+            load_failures: Vec::new(),
+            loaded_status_count: 0,
+            loading_status_ids: BTreeSet::new(),
             triage_receiver: None,
             triage_target: None,
             triage: HashMap::new(),
@@ -314,29 +334,107 @@ impl App {
     fn start_loading(&mut self, pending: PendingLoad) {
         let source = Arc::clone(&self.workflow_source);
         let repository = pending.repository.clone();
+        let wanted_ids: Option<BTreeSet<u64>> = pending
+            .workflow_ids
+            .as_ref()
+            .map(|ids| ids.iter().copied().collect());
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send(source.list_workflows(&repository));
+            let workflows = match source.list_workflows(&repository) {
+                Ok(workflows) => workflows,
+                Err(error) => {
+                    let _ = sender.send(LoadEvent::Fatal(error.to_string()));
+                    return;
+                }
+            };
+            if sender
+                .send(LoadEvent::Discovered(workflows.clone()))
+                .is_err()
+            {
+                return;
+            }
+            let _ = &wanted_ids;
+            let targets: Vec<Workflow> = workflows;
+            {
+                let _unused = |wanted_ids: BTreeSet<u64>, workflow: &Workflow| {
+                    wanted_ids.contains(&workflow.id)
+                };
+            }
+            for chunk in targets.chunks(MAX_CONCURRENT_REQUESTS) {
+                thread::scope(|scope| {
+                    for workflow in chunk {
+                        let sender = sender.clone();
+                        let source = Arc::clone(&source);
+                        let repository = &repository;
+                        scope.spawn(move || {
+                            let event = match source.load_workflow_status(repository, workflow) {
+                                Ok(workflow) => LoadEvent::WorkflowLoaded(workflow),
+                                Err(error) => LoadEvent::WorkflowFailed {
+                                    id: workflow.id,
+                                    name: workflow.name.clone(),
+                                    error: error.to_string(),
+                                },
+                            };
+                            let _ = sender.send(event);
+                        });
+                    }
+                });
+            }
+            let _ = sender.send(LoadEvent::Complete);
         });
         self.load_receiver = Some(receiver);
         self.pending_load = Some(pending);
+        self.load_failures.clear();
+        self.loaded_status_count = 0;
+        self.loading_status_ids.clear();
         self.message = None;
     }
 
     fn poll_loading(&mut self) {
-        let Some(receiver) = self.load_receiver.as_ref() else {
-            return;
-        };
-
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                self.finish_loading(Err("workflow loading stopped unexpectedly".to_owned()));
+        loop {
+            let Some(receiver) = self.load_receiver.as_ref() else {
                 return;
+            };
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.finish_loading(Err("workflow loading stopped unexpectedly".to_owned()));
+                    return;
+                }
+            };
+            self.handle_load_event(event);
+        }
+    }
+
+    fn handle_load_event(&mut self, event: LoadEvent) {
+        match event {
+            LoadEvent::Discovered(workflows) => self.apply_discovered_workflows(workflows),
+            LoadEvent::WorkflowLoaded(workflow) => {
+                let selected_ids = self.selected_workflow_ids();
+                self.loading_status_ids.remove(&workflow.id);
+                if let Some(existing) = self
+                    .workflows
+                    .iter_mut()
+                    .find(|existing| existing.id == workflow.id)
+                {
+                    *existing = workflow;
+                    self.loaded_status_count += 1;
+                }
+                self.repair_all_tab_selections(Some(selected_ids));
             }
-        };
-        self.finish_loading(result.map_err(|error| error.to_string()));
+            LoadEvent::WorkflowFailed { id, name, error } => {
+                self.loading_status_ids.remove(&id);
+                if self.workflows.iter().any(|workflow| workflow.id == id) {
+                    self.loaded_status_count += 1;
+                }
+                let failure = format!("{name}: {error}");
+                self.message = Some(format!("E484: Could not load status for {failure}"));
+                self.load_failures.push(failure);
+            }
+            LoadEvent::Fatal(error) => self.finish_loading(Err(error)),
+            LoadEvent::Complete => self.finish_loading(Ok(())),
+        }
     }
 
     fn poll_triage(&mut self) {
@@ -431,67 +529,111 @@ impl App {
         }
     }
 
-    fn finish_loading(&mut self, result: Result<Vec<Workflow>, String>) {
+    fn apply_discovered_workflows(&mut self, mut workflows: Vec<Workflow>) {
+        let Some(pending) = self.pending_load.as_ref() else {
+            return;
+        };
+        let selected_ids = self.selected_workflow_ids();
+        let kind = pending.kind;
+        let repository = pending.repository.clone();
+        let workflow_ids = pending.workflow_ids.clone();
+        let state_path = pending.state_path.clone();
+        let saved_tabs = pending.tabs.clone();
+        let saved_active_tab = pending.active_tab;
+
+        let mut carried_over = BTreeSet::new();
+        if kind == LoadKind::Refresh {
+            for workflow in &mut workflows {
+                if let Some(previous) = self
+                    .workflows
+                    .iter()
+                    .find(|previous| previous.id == workflow.id)
+                {
+                    workflow.run_status = previous.run_status;
+                    workflow.is_in_progress = previous.is_in_progress;
+                    workflow.run_metrics = previous.run_metrics;
+                    carried_over.insert(workflow.id);
+                }
+            }
+        }
+        self.repository = repository;
+        self.workflows = match workflow_ids {
+            Some(workflow_ids) => ViewState::resolve_workflows(&workflow_ids, workflows),
+            None => workflows,
+        };
+        self.loading_status_ids = self
+            .workflows
+            .iter()
+            .map(|workflow| workflow.id)
+            .filter(|id| !carried_over.contains(id))
+            .collect();
+        self.loaded_status_count = 0;
+        self.state_path = state_path;
+        if kind != LoadKind::Refresh {
+            self.tabs = saved_tabs.map_or_else(
+                || {
+                    vec![Tab::new(
+                        None,
+                        self.workflows.iter().map(|workflow| workflow.id).collect(),
+                        None,
+                        None,
+                    )]
+                },
+                |tabs| {
+                    tabs.into_iter()
+                        .map(|tab| {
+                            let selected_ids = std::iter::once(tab.selected_workflow_id)
+                                .chain(
+                                    tab.additional_views
+                                        .iter()
+                                        .map(|view| view.selected_workflow_id),
+                                )
+                                .collect::<Vec<_>>();
+                            let mut runtime = Tab::from_view(tab);
+                            for (view, selected_id) in runtime.views.iter_mut().zip(selected_ids) {
+                                let selected = selected_id.and_then(|id| {
+                                    self.visible_workflows_for(view)
+                                        .iter()
+                                        .position(|workflow| workflow.id == id)
+                                });
+                                view.table_state.select(selected);
+                            }
+                            runtime
+                        })
+                        .collect()
+                },
+            );
+            self.active_tab = saved_active_tab.min(self.tabs.len().saturating_sub(1));
+        }
+        self.repair_all_tab_selections((kind == LoadKind::Refresh).then_some(selected_ids));
+        self.message = Some(format!(
+            "{} workflows discovered; loading run status...",
+            self.workflows.len()
+        ));
+    }
+
+    fn finish_loading(&mut self, result: Result<(), String>) {
         self.load_receiver = None;
+        self.loading_status_ids.clear();
         let Some(pending) = self.pending_load.take() else {
             return;
         };
 
         match result {
-            Ok(workflows) => {
-                let selected_ids = self.selected_workflow_ids();
-                self.repository = pending.repository;
-                self.workflows = match pending.workflow_ids {
-                    Some(workflow_ids) => ViewState::resolve_workflows(&workflow_ids, workflows),
-                    None => workflows,
-                };
-                self.state_path = pending.state_path;
-                if pending.kind != LoadKind::Refresh {
-                    self.tabs = pending.tabs.map_or_else(
-                        || {
-                            vec![Tab::new(
-                                None,
-                                self.workflows.iter().map(|workflow| workflow.id).collect(),
-                                None,
-                                None,
-                            )]
-                        },
-                        |tabs| {
-                            tabs.into_iter()
-                                .map(|tab| {
-                                    let selected_ids = std::iter::once(tab.selected_workflow_id)
-                                        .chain(
-                                            tab.additional_views
-                                                .iter()
-                                                .map(|view| view.selected_workflow_id),
-                                        )
-                                        .collect::<Vec<_>>();
-                                    let mut runtime = Tab::from_view(tab);
-                                    for (view, selected_id) in
-                                        runtime.views.iter_mut().zip(selected_ids)
-                                    {
-                                        let selected = selected_id.and_then(|id| {
-                                            self.visible_workflows_for(view)
-                                                .iter()
-                                                .position(|workflow| workflow.id == id)
-                                        });
-                                        view.table_state.select(selected);
-                                    }
-                                    runtime
-                                })
-                                .collect()
-                        },
-                    );
-                    self.active_tab = pending.active_tab.min(self.tabs.len().saturating_sub(1));
-                }
-                self.repair_all_tab_selections(
-                    (pending.kind == LoadKind::Refresh).then_some(selected_ids),
-                );
-                self.message = Some(match pending.kind {
+            Ok(()) => {
+                let completed = match pending.kind {
                     LoadKind::Refresh => format!("{} workflows refreshed", self.workflows.len()),
                     LoadKind::Initial | LoadKind::Edit => {
                         format!("{} workflows loaded", self.workflows.len())
                     }
+                };
+                self.message = Some(if self.load_failures.is_empty() {
+                    completed
+                } else {
+                    format!(
+                        "{completed}; {} workflow statuses failed",
+                        self.load_failures.len()
+                    )
                 });
             }
             Err(error) => self.message = Some(format!("E484: {error}")),
@@ -643,10 +785,16 @@ impl App {
                 } else {
                     " LOADING "
                 },
-                format!(
-                    "{action} workflows and run status for {}...",
-                    pending.repository
-                ),
+                if self.workflows.is_empty() {
+                    format!("{action} workflows for {}...", pending.repository)
+                } else {
+                    format!(
+                        "{action} run status for {}... ({}/{})",
+                        pending.repository,
+                        self.loaded_status_count,
+                        self.workflows.len()
+                    )
+                },
             )
         } else {
             (
@@ -1549,6 +1697,7 @@ impl App {
             let pane_areas = layout_areas(&self.active_tab().layout, table_area);
             self.pane_areas.clone_from(&pane_areas);
             let active_tab = self.active_tab;
+            let loading_status_ids = self.loading_status_ids.clone();
             for (view_index, area) in pane_areas {
                 let workflows = self
                     .visible_workflows_for(&self.tabs[active_tab].views[view_index])
@@ -1570,6 +1719,7 @@ impl App {
                     loading,
                     is_filtered,
                     flash,
+                    &loading_status_ids,
                 );
             }
         }
@@ -1905,6 +2055,7 @@ fn render_list_view(
     loading: bool,
     is_filtered: bool,
     flash_visible: bool,
+    loading_status_ids: &BTreeSet<u64>,
 ) {
     let border_style = if active {
         Style::default()
@@ -1941,6 +2092,15 @@ fn render_list_view(
         )
         .bottom_margin(1);
     let rows = workflows.iter().map(|workflow| {
+        if loading_status_ids.contains(&workflow.id) {
+            return Row::new([
+                Cell::from("..."),
+                Cell::from(workflow.name.as_str()),
+                Cell::from("loading..."),
+                Cell::from("loading..."),
+                Cell::from("loading..."),
+            ]);
+        }
         Row::new([
             Cell::from(status_indicator(workflow, flash_visible)),
             Cell::from(workflow.name.as_str()),
@@ -2388,6 +2548,69 @@ mod tests {
         }
     }
 
+    struct ProgressiveWorkflowSource;
+
+    impl WorkflowSource for ProgressiveWorkflowSource {
+        fn list_workflows(
+            &self,
+            _repository: &Repository,
+        ) -> Result<Vec<Workflow>, crate::github::Error> {
+            Ok(vec![workflow(1), workflow(2)])
+        }
+
+        fn load_workflow_status(
+            &self,
+            _repository: &Repository,
+            workflow: &Workflow,
+        ) -> Result<Workflow, crate::github::Error> {
+            let mut workflow = workflow.clone();
+            workflow.run_status = RunStatus::Success;
+            Ok(workflow)
+        }
+
+        fn triage_workflows(
+            &self,
+            _repository: &Repository,
+            _workflows: &[Workflow],
+        ) -> Result<Vec<WorkflowTriage>, crate::github::Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWorkflowSource {
+        discovered_ids: Vec<u64>,
+        loaded_ids: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl WorkflowSource for RecordingWorkflowSource {
+        fn list_workflows(
+            &self,
+            _repository: &Repository,
+        ) -> Result<Vec<Workflow>, crate::github::Error> {
+            Ok(self.discovered_ids.iter().copied().map(workflow).collect())
+        }
+
+        fn load_workflow_status(
+            &self,
+            _repository: &Repository,
+            workflow: &Workflow,
+        ) -> Result<Workflow, crate::github::Error> {
+            self.loaded_ids.lock().unwrap().push(workflow.id);
+            let mut workflow = workflow.clone();
+            workflow.run_status = RunStatus::Success;
+            Ok(workflow)
+        }
+
+        fn triage_workflows(
+            &self,
+            _repository: &Repository,
+            _workflows: &[Workflow],
+        ) -> Result<Vec<WorkflowTriage>, crate::github::Error> {
+            Ok(Vec::new())
+        }
+    }
+
     fn workflow(id: u64) -> Workflow {
         Workflow {
             id,
@@ -2424,14 +2647,15 @@ mod tests {
     }
 
     fn complete_loading(app: &mut App) {
-        let result = app
-            .load_receiver
-            .as_ref()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .map_err(|error| error.to_string());
-        app.finish_loading(result);
+        while app.is_loading() {
+            let event = app
+                .load_receiver
+                .as_ref()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            app.handle_load_event(event);
+        }
     }
 
     fn complete_triage(app: &mut App) {
@@ -2665,7 +2889,7 @@ mod tests {
             app.normal_status(),
             (
                 " LOADING ",
-                "Loading workflows and run status for owner/repository...".to_owned()
+                "Loading workflows for owner/repository...".to_owned()
             )
         );
 
@@ -2674,6 +2898,149 @@ mod tests {
         assert!(!app.is_loading());
         assert_eq!(app.workflows.len(), 100);
         assert_eq!(app.active_tab().table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn initial_load_displays_workflows_before_statuses_finish() {
+        let mut app = App::new_loading(
+            "owner/repository".parse().unwrap(),
+            None,
+            None,
+            Arc::new(ProgressiveWorkflowSource),
+            None,
+            0,
+        );
+        let discovered = app
+            .load_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        app.handle_load_event(discovered);
+
+        assert!(app.is_loading());
+        assert_eq!(app.workflows.len(), 2);
+        assert_eq!(app.workflows[0].run_status, RunStatus::Other);
+        assert_eq!(app.active_tab().table_state.selected(), Some(0));
+        assert_eq!(
+            app.normal_status().1,
+            "Loading run status for owner/repository... (0/2)"
+        );
+        assert_eq!(app.loading_status_ids, BTreeSet::from([1, 2]));
+
+        complete_loading(&mut app);
+
+        assert!(!app.is_loading());
+        assert!(
+            app.workflows
+                .iter()
+                .all(|workflow| workflow.run_status == RunStatus::Success)
+        );
+        assert!(app.loading_status_ids.is_empty());
+    }
+
+    #[test]
+    fn refresh_progress_counts_only_displayed_workflows() {
+        let source = Arc::new(RecordingWorkflowSource {
+            discovered_ids: vec![1, 2, 3, 4, 5],
+            loaded_ids: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            "owner/repository".parse().unwrap(),
+            vec![workflow(2), workflow(4)],
+            None,
+            Arc::clone(&source) as Arc<dyn WorkflowSource>,
+            None,
+        );
+
+        app.refresh_workflows();
+        complete_loading(&mut app);
+
+        let mut loaded = source.loaded_ids.lock().unwrap().clone();
+        loaded.sort_unstable();
+        assert_eq!(loaded, vec![2, 4]);
+        assert_eq!(app.loaded_status_count, 2);
+        assert_eq!(app.workflows.len(), 2);
+    }
+
+    #[test]
+    fn refresh_progress_never_exceeds_total_while_statuses_stream_in() {
+        let source = Arc::new(RecordingWorkflowSource {
+            discovered_ids: vec![1, 2, 3, 4, 5],
+            loaded_ids: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut app = App::new(
+            "owner/repository".parse().unwrap(),
+            vec![workflow(2), workflow(4)],
+            None,
+            Arc::clone(&source) as Arc<dyn WorkflowSource>,
+            None,
+        );
+
+        app.refresh_workflows();
+        while app.is_loading() {
+            let event = app
+                .load_receiver
+                .as_ref()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            app.handle_load_event(event);
+            assert!(
+                app.loaded_status_count <= app.workflows.len(),
+                "progress {} exceeded total {}",
+                app.loaded_status_count,
+                app.workflows.len()
+            );
+            if app.is_loading() && !app.workflows.is_empty() {
+                assert_eq!(
+                    app.normal_status().1,
+                    format!(
+                        "Refreshing run status for owner/repository... ({}/2)",
+                        app.loaded_status_count
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_previous_status_visible_instead_of_marking_rows_loading() {
+        let mut app = app(2);
+        app.workflows[0].run_status = RunStatus::Failure;
+        app.workflows[0].run_metrics.last_24_hours = RunCounts {
+            passed: 3,
+            failed: 1,
+            total: 4,
+        };
+        app.workflows[1].run_status = RunStatus::Success;
+
+        app.refresh_workflows();
+        let discovered = app
+            .load_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        app.handle_load_event(discovered);
+
+        assert!(app.is_loading());
+        assert!(app.loading_status_ids.is_empty());
+        assert_eq!(app.workflows[0].run_status, RunStatus::Failure);
+        assert_eq!(
+            app.workflows[0].run_metrics.last_24_hours,
+            RunCounts {
+                passed: 3,
+                failed: 1,
+                total: 4
+            }
+        );
+        assert_eq!(app.workflows[1].run_status, RunStatus::Success);
+
+        complete_loading(&mut app);
+
+        assert!(app.loading_status_ids.is_empty());
+        assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
     }
 
     #[test]

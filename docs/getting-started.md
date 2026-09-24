@@ -24,11 +24,13 @@ cargo run -- saved-view.json
 ```
 
 The terminal UI opens immediately, then uses the authenticated `gh api`
-command to load GitHub Actions workflows and run status in the background. The
-bottom status bar displays the repository being loaded until the data is
-ready. Current data refreshes automatically every 15 seconds; the interval is
-shown in the bottom bar and can be changed for the current session with
-`:refresh-rate N`.
+command to discover active GitHub Actions workflows in the background. The
+workflow rows appear as soon as discovery completes. Status and 24-hour,
+7-day, and 14-day metrics fill in incrementally, with up to eight workflow
+histories queried concurrently. The bottom status bar displays progress while
+that enrichment is running. Current data refreshes automatically every 15
+seconds; the interval is shown in the bottom bar and can be changed for the
+current session with `:refresh-rate N`.
 When a state file is supplied, its saved global workflow IDs and tab
 arrangement are restored. Each tab keeps its own name, workflow subset, filter,
 sort, and selection. Workflow names, paths, workflow state, and run status are
