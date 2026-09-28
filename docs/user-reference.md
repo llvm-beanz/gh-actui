@@ -106,7 +106,7 @@ to execute a command or Escape to return to Normal mode.
 | `Ctrl-u` or Page Up | Move backward up to 10 workflows |
 | `gg` or Home | Select the first workflow |
 | `G` or End | Select the last workflow |
-| Enter | Open the selected workflow's run history in a new tab |
+| Enter | Open the selected workflow's runs, or triage the selected run |
 | `Ctrl+Tab` | Switch to the next tab |
 | `Ctrl+Shift+Tab` | Switch to the previous tab |
 | `Ctrl-w`, then an arrow or `h`/`j`/`k`/`l` | Focus the split view in that direction |
@@ -276,6 +276,10 @@ Active run durations continue from their start time; queued runs that have not
 started display `-`.
 
 Use the normal `j`/`k`, arrow, paging, and jump bindings to navigate runs.
+Press Enter on a run to split the lower panel vertically. The run table remains
+on the left, while the right half loads and displays that run's failed jobs,
+failed steps, failed tests, unexpected passes, and lit summary. Selecting
+another run and pressing Enter replaces the right-hand triage output.
 `:refresh` reloads the run table. Workflow detail tabs cannot be split and,
 like triage tabs, are not included in saved session state.
 

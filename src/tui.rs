@@ -146,6 +146,8 @@ struct Tab {
     details_workflow_id: Option<u64>,
     runs: Vec<WorkflowRunDetail>,
     run_table_state: TableState,
+    run_triage_run_id: Option<u64>,
+    run_triage: Option<WorkflowTriage>,
 }
 
 impl Tab {
@@ -164,6 +166,8 @@ impl Tab {
             details_workflow_id: None,
             runs: Vec::new(),
             run_table_state: TableState::default(),
+            run_triage_run_id: None,
+            run_triage: None,
         }
     }
 
@@ -183,6 +187,8 @@ impl Tab {
             details_workflow_id: None,
             runs: Vec::new(),
             run_table_state: TableState::default(),
+            run_triage_run_id: None,
+            run_triage: None,
         }
     }
 
@@ -228,6 +234,8 @@ struct App {
     triage: HashMap<u64, WorkflowTriage>,
     run_details_receiver: Option<Receiver<Result<Vec<WorkflowRunDetail>, crate::github::Error>>>,
     run_details_target: Option<usize>,
+    run_triage_receiver: Option<Receiver<Result<WorkflowTriage, crate::github::Error>>>,
+    run_triage_target: Option<(usize, u64, u64)>,
     tabs: Vec<Tab>,
     active_tab: usize,
     mode: Mode,
@@ -288,6 +296,8 @@ impl App {
             triage: HashMap::new(),
             run_details_receiver: None,
             run_details_target: None,
+            run_triage_receiver: None,
+            run_triage_target: None,
             tabs,
             active_tab,
             mode: Mode::Normal,
@@ -335,6 +345,7 @@ impl App {
             self.poll_loading();
             self.poll_triage();
             self.poll_run_details();
+            self.poll_run_triage();
             self.refresh_if_due();
             terminal.draw(|frame| self.render(frame))?;
 
@@ -508,11 +519,52 @@ impl App {
                 let tab = &mut self.tabs[index];
                 tab.runs = runs;
                 tab.run_table_state.select((count > 0).then_some(0));
+                if tab
+                    .run_triage_run_id
+                    .is_some_and(|run_id| !tab.runs.iter().any(|run| run.id == run_id))
+                {
+                    tab.run_triage_run_id = None;
+                    tab.run_triage = None;
+                }
                 self.message = Some(format!("{count} workflow runs loaded"));
             }
             (Ok(_), _) => {
                 self.message =
                     Some("E484: workflow detail destination is no longer available".to_owned());
+            }
+            (Err(error), _) => self.message = Some(format!("E484: {error}")),
+        }
+    }
+
+    fn poll_run_triage(&mut self) {
+        let Some(receiver) = self.run_triage_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.run_triage_receiver = None;
+                self.run_triage_target = None;
+                self.message = Some("E484: run triage stopped unexpectedly".to_owned());
+                return;
+            }
+        };
+        self.run_triage_receiver = None;
+        let target = self.run_triage_target.take();
+        match (result, target) {
+            (Ok(triage), Some((index, workflow_id, run_id)))
+                if self.tabs.get(index).is_some_and(|tab| {
+                    tab.details_workflow_id == Some(workflow_id)
+                        && tab.run_triage_run_id == Some(run_id)
+                }) =>
+            {
+                self.tabs[index].run_triage = Some(triage);
+                self.message = Some(format!("Run {run_id} triaged"));
+            }
+            (Ok(_), _) => {
+                self.message =
+                    Some("E484: run triage destination is no longer available".to_owned());
             }
             (Err(error), _) => self.message = Some(format!("E484: {error}")),
         }
@@ -786,6 +838,7 @@ impl App {
         if !self.is_loading()
             && self.triage_receiver.is_none()
             && self.run_details_receiver.is_none()
+            && self.run_triage_receiver.is_none()
             && Instant::now() >= self.next_refresh
         {
             self.refresh_workflows();
@@ -806,6 +859,7 @@ impl App {
         if self.is_loading()
             || self.triage_receiver.is_some()
             || self.run_details_receiver.is_some()
+            || self.run_triage_receiver.is_some()
         {
             self.message = Some("Triage or refresh already in progress".to_owned());
             return;
@@ -830,6 +884,11 @@ impl App {
             (
                 " TRIAGING ",
                 "Analyzing scheduled failures, jobs, steps, and logs...".to_owned(),
+            )
+        } else if self.run_triage_receiver.is_some() {
+            (
+                " TRIAGING ",
+                "Analyzing the selected run's jobs, steps, and logs...".to_owned(),
             )
         } else if self.run_details_receiver.is_some() {
             (" LOADING ", "Loading previous workflow runs...".to_owned())
@@ -939,7 +998,13 @@ impl App {
                 self.pending_g = true;
                 return;
             }
-            KeyCode::Enter => self.open_workflow_details(),
+            KeyCode::Enter => {
+                if self.active_tab().details_workflow_id.is_some() {
+                    self.start_selected_run_triage();
+                } else {
+                    self.open_workflow_details();
+                }
+            }
             KeyCode::Char(':') => {
                 self.mode = Mode::Command;
                 self.command.clear();
@@ -1555,6 +1620,48 @@ impl App {
         self.message = None;
     }
 
+    fn start_selected_run_triage(&mut self) {
+        if self.run_triage_receiver.is_some() {
+            self.message = Some("Run triage already in progress".to_owned());
+            return;
+        }
+        let tab_index = self.active_tab;
+        let Some(workflow_id) = self.active_tab().details_workflow_id else {
+            return;
+        };
+        let Some(run_id) = self
+            .active_tab()
+            .run_table_state
+            .selected()
+            .and_then(|selected| self.active_tab().runs.get(selected))
+            .map(|run| run.id)
+        else {
+            self.message = Some("E749: Empty buffer".to_owned());
+            return;
+        };
+        let Some(workflow) = self
+            .workflows
+            .iter()
+            .find(|workflow| workflow.id == workflow_id)
+            .cloned()
+        else {
+            self.message = Some("E484: Workflow is no longer available".to_owned());
+            return;
+        };
+
+        self.active_tab_mut().run_triage_run_id = Some(run_id);
+        self.active_tab_mut().run_triage = None;
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.triage_run(&repository, &workflow, run_id));
+        });
+        self.run_triage_receiver = Some(receiver);
+        self.run_triage_target = Some((tab_index, workflow_id, run_id));
+        self.message = None;
+    }
+
     fn start_triage(&mut self) {
         if self.triage_receiver.is_some() {
             self.message = Some("Triage already in progress".to_owned());
@@ -1856,6 +1963,14 @@ impl App {
                     .areas(table_area);
             let tab = &mut self.tabs[self.active_tab];
             render_workflow_run_summary(frame, summary_area, &tab.runs);
+            let (runs_area, triage_area) = if tab.run_triage_run_id.is_some() {
+                let [left, right] =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .areas(runs_area);
+                (left, Some(right))
+            } else {
+                (runs_area, None)
+            };
             render_workflow_runs(
                 frame,
                 runs_area,
@@ -1865,6 +1980,27 @@ impl App {
                 &mut tab.run_table_state,
                 loading,
             );
+            if let Some(triage_area) = triage_area {
+                let run_id = tab.run_triage_run_id.unwrap();
+                let text = if self.run_triage_target
+                    == tab
+                        .details_workflow_id
+                        .map(|workflow_id| (self.active_tab, workflow_id, run_id))
+                    && self.run_triage_receiver.is_some()
+                {
+                    Text::from("Triaging selected run...")
+                } else {
+                    triage_text(tab.run_triage.as_ref())
+                };
+                frame.render_widget(
+                    Paragraph::new(text).wrap(Wrap { trim: false }).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(" Run {run_id} triage ")),
+                    ),
+                    triage_area,
+                );
+            }
         } else {
             let pane_areas = layout_areas(&self.active_tab().layout, table_area);
             self.pane_areas.clone_from(&pane_areas);
@@ -2978,6 +3114,22 @@ mod tests {
                 },
             ])
         }
+
+        fn triage_run(
+            &self,
+            _repository: &Repository,
+            workflow: &Workflow,
+            run_id: u64,
+        ) -> Result<WorkflowTriage, crate::github::Error> {
+            Ok(WorkflowTriage {
+                workflow_id: workflow.id,
+                failed_jobs: format!("Run {run_id} job"),
+                failed_steps: format!("Run {run_id} step"),
+                failed_tests: vec![format!("run-{run_id}.test")],
+                unexpectedly_passed_tests: Vec::new(),
+                lit_summary: format!("Run {run_id} summary"),
+            })
+        }
     }
 
     struct ProgressiveWorkflowSource;
@@ -3120,6 +3272,20 @@ mod tests {
         app.tabs[target]
             .run_table_state
             .select((count > 0).then_some(0));
+    }
+
+    fn complete_run_triage(app: &mut App) {
+        let result = app
+            .run_triage_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        app.run_triage_receiver = None;
+        let (target, workflow_id, run_id) = app.run_triage_target.take().unwrap();
+        assert_eq!(app.tabs[target].details_workflow_id, Some(workflow_id));
+        assert_eq!(app.tabs[target].run_triage_run_id, Some(run_id));
+        app.tabs[target].run_triage = Some(result.unwrap());
     }
 
     #[test]
@@ -3579,6 +3745,46 @@ mod tests {
         assert_eq!(app.active_tab().run_table_state.selected(), Some(1));
         app.select_previous(1);
         assert_eq!(app.active_tab().run_table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn enter_on_workflow_run_loads_triage_into_detail_split() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active_tab().run_triage_run_id, Some(2));
+        assert!(app.active_tab().run_triage.is_none());
+        assert!(app.run_triage_receiver.is_some());
+        assert_eq!(app.normal_status().0, " TRIAGING ");
+        complete_run_triage(&mut app);
+
+        assert_eq!(
+            app.active_tab().run_triage.as_ref().unwrap().failed_steps,
+            "Run 2 step"
+        );
+    }
+
+    #[test]
+    fn enter_on_another_workflow_run_replaces_triage_output() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_triage(&mut app);
+
+        app.select_next(1);
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active_tab().run_triage_run_id, Some(1));
+        assert!(app.active_tab().run_triage.is_none());
+        complete_run_triage(&mut app);
+        assert_eq!(
+            app.active_tab().run_triage.as_ref().unwrap().failed_steps,
+            "Run 1 step"
+        );
     }
 
     #[test]

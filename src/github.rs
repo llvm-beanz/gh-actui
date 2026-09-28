@@ -163,6 +163,8 @@ pub enum Error {
     InvalidResponse(#[from] serde_json::Error),
     #[error("a workflow status worker stopped unexpectedly")]
     StatusWorker,
+    #[error("this workflow source does not support run triage")]
+    RunTriageUnavailable,
 }
 
 pub trait WorkflowSource: Send + Sync {
@@ -186,6 +188,14 @@ pub trait WorkflowSource: Send + Sync {
         repository: &Repository,
         workflows: &[Workflow],
     ) -> Result<Vec<WorkflowTriage>, Error>;
+    fn triage_run(
+        &self,
+        _repository: &Repository,
+        _workflow: &Workflow,
+        _run_id: u64,
+    ) -> Result<WorkflowTriage, Error> {
+        Err(Error::RunTriageUnavailable)
+    }
     /// Persist any cached data gathered during a load.
     fn flush(&self) {}
 }
@@ -297,6 +307,15 @@ impl WorkflowSource for GhWorkflowSource {
             triage.extend(results.into_iter().flatten());
         }
         Ok(triage)
+    }
+
+    fn triage_run(
+        &self,
+        repository: &Repository,
+        workflow: &Workflow,
+        run_id: u64,
+    ) -> Result<WorkflowTriage, Error> {
+        build_run_triage(repository, workflow.id, run_id)
     }
 
     fn flush(&self) {
@@ -672,6 +691,14 @@ fn triage_workflow(
     let Some(run_id) = find_failed_scheduled_run(&runs_path)? else {
         return Ok(None);
     };
+    Ok(Some(build_run_triage(repository, workflow.id, run_id)?))
+}
+
+fn build_run_triage(
+    repository: &Repository,
+    workflow_id: u64,
+    run_id: u64,
+) -> Result<WorkflowTriage, Error> {
     let failures = fetch_failed_jobs(repository, run_id)?;
     let failed_jobs = failures
         .iter()
@@ -705,18 +732,22 @@ fn triage_workflow(
     unexpectedly_passed_tests.sort();
     unexpectedly_passed_tests.dedup();
 
-    Ok(Some(WorkflowTriage {
-        workflow_id: workflow.id,
+    Ok(WorkflowTriage {
+        workflow_id,
         failed_jobs: if failed_jobs.is_empty() {
             "(no failed jobs reported)".to_owned()
         } else {
             failed_jobs
         },
-        failed_steps,
+        failed_steps: if failed_steps.is_empty() {
+            "(no failed steps reported)".to_owned()
+        } else {
+            failed_steps
+        },
         failed_tests,
         unexpectedly_passed_tests,
         lit_summary: summaries.join("\n\n"),
-    }))
+    })
 }
 
 fn workflow_has_schedule_trigger(
