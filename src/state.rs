@@ -277,6 +277,8 @@ mod tests {
                 run_status: crate::github::RunStatus::Success,
                 is_in_progress: true,
                 run_metrics: crate::github::RunMetrics::default(),
+                last_completed_run_id: None,
+                failing_steps: None,
             },
             Workflow {
                 id: 7,
@@ -286,6 +288,8 @@ mod tests {
                 run_status: crate::github::RunStatus::Failure,
                 is_in_progress: false,
                 run_metrics: crate::github::RunMetrics::default(),
+                last_completed_run_id: None,
+                failing_steps: None,
             },
         ];
         ViewState::new(
@@ -390,6 +394,8 @@ mod tests {
                 run_status: crate::github::RunStatus::Success,
                 is_in_progress: true,
                 run_metrics: crate::github::RunMetrics::default(),
+                last_completed_run_id: None,
+                failing_steps: None,
             },
             Workflow {
                 id: 42,
@@ -399,6 +405,8 @@ mod tests {
                 run_status: crate::github::RunStatus::Failure,
                 is_in_progress: false,
                 run_metrics: crate::github::RunMetrics::default(),
+                last_completed_run_id: None,
+                failing_steps: None,
             },
         ];
 

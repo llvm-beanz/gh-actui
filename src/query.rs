@@ -326,6 +326,8 @@ mod tests {
                 last_7_days: rate,
                 last_14_days: rate,
             },
+            last_completed_run_id: None,
+            failing_steps: None,
         }
     }
 

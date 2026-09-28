@@ -23,6 +23,12 @@ the visible area.
 The status indicator flashes every half second while the workflow has a run in
 progress.
 
+The Failing Steps column displays all unique failed step names from the latest
+completed run when that run failed. Multiple names are comma-separated in API
+order. Runs with another conclusion display `-`; a failed run without
+step-level failure data displays `(no failed step reported)`. Step names are
+reused across refreshes while the latest completed run remains unchanged.
+
 The 24 Hours, 7 Days, and 14 Days columns summarize completed runs as:
 
 ```text

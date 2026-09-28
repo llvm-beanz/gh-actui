@@ -26,6 +26,10 @@ pub struct Workflow {
     pub is_in_progress: bool,
     #[serde(skip)]
     pub run_metrics: RunMetrics,
+    #[serde(skip)]
+    pub last_completed_run_id: Option<u64>,
+    #[serde(skip)]
+    pub failing_steps: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -240,6 +244,25 @@ impl WorkflowSource for GhWorkflowSource {
         workflow.run_status = summary.run_status;
         workflow.is_in_progress = summary.is_in_progress;
         workflow.run_metrics = summary.run_metrics;
+        if summary.run_status == RunStatus::Failure {
+            let unchanged = workflow.last_completed_run_id == summary.last_completed_run_id;
+            if !unchanged || workflow.failing_steps.is_none() {
+                workflow.failing_steps = match summary.last_completed_run_id {
+                    Some(run_id) => {
+                        let steps = fetch_failed_step_names(repository, run_id)?;
+                        Some(if steps.is_empty() {
+                            "(no failed step reported)".to_owned()
+                        } else {
+                            steps.join(", ")
+                        })
+                    }
+                    None => Some("(no failed step reported)".to_owned()),
+                };
+            }
+        } else {
+            workflow.failing_steps = None;
+        }
+        workflow.last_completed_run_id = summary.last_completed_run_id;
         Ok(workflow)
     }
 
@@ -582,6 +605,7 @@ struct RunSummary {
     run_status: RunStatus,
     is_in_progress: bool,
     run_metrics: RunMetrics,
+    last_completed_run_id: Option<u64>,
 }
 
 fn summarize_runs(runs: &[CachedRun], now: DateTime<Utc>) -> RunSummary {
@@ -593,6 +617,7 @@ fn summarize_runs(runs: &[CachedRun], now: DateTime<Utc>) -> RunSummary {
         }
 
         if run.status.as_deref() == Some("completed") && !found_completed {
+            summary.last_completed_run_id = run.id;
             summary.run_status = match run.conclusion.as_deref() {
                 Some("success") => RunStatus::Success,
                 Some("failure") => RunStatus::Failure,
@@ -782,39 +807,64 @@ struct FailedJob {
 }
 
 fn fetch_failed_jobs(repository: &Repository, run_id: u64) -> Result<Vec<FailedJob>, Error> {
-    let base_path = repository.run_jobs_api_path(run_id);
+    let jobs = fetch_jobs(repository, run_id)?;
     let mut failures = Vec::new();
+    for job in jobs {
+        if matches!(
+            job.conclusion.as_deref(),
+            None | Some("success" | "skipped" | "neutral")
+        ) {
+            continue;
+        }
+        let failed_step = job.steps.into_iter().find(|step| {
+            !matches!(
+                step.conclusion.as_deref(),
+                None | Some("success" | "skipped")
+            )
+        });
+        failures.push(FailedJob {
+            job_id: job.id,
+            job_name: job.name,
+            step_name: failed_step.map(|step| step.name),
+        });
+    }
+    Ok(failures)
+}
+
+fn fetch_failed_step_names(repository: &Repository, run_id: u64) -> Result<Vec<String>, Error> {
+    Ok(failed_step_names(fetch_jobs(repository, run_id)?))
+}
+
+fn failed_step_names(jobs: Vec<Job>) -> Vec<String> {
+    let mut names = Vec::new();
+    for step in jobs
+        .into_iter()
+        .flat_map(|job| job.steps)
+        .filter(|step| step.conclusion.as_deref() == Some("failure"))
+    {
+        if !names.contains(&step.name) {
+            names.push(step.name);
+        }
+    }
+    names
+}
+
+fn fetch_jobs(repository: &Repository, run_id: u64) -> Result<Vec<Job>, Error> {
+    let base_path = repository.run_jobs_api_path(run_id);
+    let mut jobs = Vec::new();
     let mut page_number = 1;
     loop {
         let path = format!("{base_path}&page={page_number}");
         let page: JobsPage =
             serde_json::from_slice(&successful_stdout(run_gh(&["api", "-X", "GET", &path])?)?)?;
         let page_len = page.jobs.len();
-        for job in page.jobs {
-            if matches!(
-                job.conclusion.as_deref(),
-                None | Some("success" | "skipped" | "neutral")
-            ) {
-                continue;
-            }
-            let failed_step = job.steps.into_iter().find(|step| {
-                !matches!(
-                    step.conclusion.as_deref(),
-                    None | Some("success" | "skipped")
-                )
-            });
-            failures.push(FailedJob {
-                job_id: job.id,
-                job_name: job.name,
-                step_name: failed_step.map(|step| step.name),
-            });
-        }
+        jobs.extend(page.jobs);
         if page_len < RUNS_PER_PAGE {
             break;
         }
         page_number += 1;
     }
-    Ok(failures)
+    Ok(jobs)
 }
 
 fn extract_lit_summary(log: &str) -> Option<String> {
@@ -1139,8 +1189,10 @@ mod tests {
 
     #[test]
     fn summarize_runs_uses_latest_completed_run() {
+        let mut latest = run("completed", Some("success"), Duration::hours(1));
+        latest.id = Some(42);
         let runs = vec![
-            run("completed", Some("success"), Duration::hours(1)),
+            latest,
             run("completed", Some("failure"), Duration::hours(2)),
             run("completed", Some("failure"), Duration::hours(3)),
         ];
@@ -1148,6 +1200,52 @@ mod tests {
         let summary = summarize_runs(&runs, now());
 
         assert_eq!(summary.run_status, RunStatus::Success);
+        assert_eq!(summary.last_completed_run_id, Some(42));
+    }
+
+    #[test]
+    fn failed_step_names_returns_unique_failures_in_api_order() {
+        let jobs = vec![
+            Job {
+                id: 1,
+                name: "Linux".to_owned(),
+                conclusion: Some("failure".to_owned()),
+                steps: vec![
+                    JobStep {
+                        name: "Checkout".to_owned(),
+                        conclusion: Some("success".to_owned()),
+                    },
+                    JobStep {
+                        name: "Build".to_owned(),
+                        conclusion: Some("failure".to_owned()),
+                    },
+                    JobStep {
+                        name: "Test".to_owned(),
+                        conclusion: Some("failure".to_owned()),
+                    },
+                ],
+            },
+            Job {
+                id: 2,
+                name: "Windows".to_owned(),
+                conclusion: Some("failure".to_owned()),
+                steps: vec![
+                    JobStep {
+                        name: "Build".to_owned(),
+                        conclusion: Some("failure".to_owned()),
+                    },
+                    JobStep {
+                        name: "Cleanup".to_owned(),
+                        conclusion: Some("cancelled".to_owned()),
+                    },
+                ],
+            },
+        ];
+
+        assert_eq!(
+            failed_step_names(jobs),
+            vec!["Build".to_owned(), "Test".to_owned()]
+        );
     }
 
     #[test]

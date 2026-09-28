@@ -353,19 +353,24 @@ impl App {
     fn start_loading(&mut self, pending: PendingLoad) {
         let source = Arc::clone(&self.workflow_source);
         let repository = pending.repository.clone();
+        let previous_workflows =
+            (pending.kind == LoadKind::Refresh).then(|| self.workflows.clone());
         let wanted_ids: Option<BTreeSet<u64>> = pending
             .workflow_ids
             .as_ref()
             .map(|ids| ids.iter().copied().collect());
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let workflows = match source.list_workflows(&repository) {
+            let mut workflows = match source.list_workflows(&repository) {
                 Ok(workflows) => workflows,
                 Err(error) => {
                     let _ = sender.send(LoadEvent::Fatal(error.to_string()));
                     return;
                 }
             };
+            if let Some(previous) = previous_workflows.as_deref() {
+                carry_workflow_runtime_fields(&mut workflows, previous);
+            }
             if sender
                 .send(LoadEvent::Discovered(workflows.clone()))
                 .is_err()
@@ -600,18 +605,7 @@ impl App {
 
         let mut carried_over = BTreeSet::new();
         if kind == LoadKind::Refresh {
-            for workflow in &mut workflows {
-                if let Some(previous) = self
-                    .workflows
-                    .iter()
-                    .find(|previous| previous.id == workflow.id)
-                {
-                    workflow.run_status = previous.run_status;
-                    workflow.is_in_progress = previous.is_in_progress;
-                    workflow.run_metrics = previous.run_metrics;
-                    carried_over.insert(workflow.id);
-                }
-            }
+            carried_over = carry_workflow_runtime_fields(&mut workflows, &self.workflows);
         }
         self.repository = repository;
         self.workflows = match workflow_ids {
@@ -1977,6 +1971,27 @@ impl App {
     }
 }
 
+fn carry_workflow_runtime_fields(
+    workflows: &mut [Workflow],
+    previous_workflows: &[Workflow],
+) -> BTreeSet<u64> {
+    let mut carried_over = BTreeSet::new();
+    for workflow in workflows {
+        if let Some(previous) = previous_workflows
+            .iter()
+            .find(|previous| previous.id == workflow.id)
+        {
+            workflow.run_status = previous.run_status;
+            workflow.is_in_progress = previous.is_in_progress;
+            workflow.run_metrics = previous.run_metrics;
+            workflow.last_completed_run_id = previous.last_completed_run_id;
+            workflow.failing_steps.clone_from(&previous.failing_steps);
+            carried_over.insert(workflow.id);
+        }
+    }
+    carried_over
+}
+
 fn split_layout_leaf(
     layout: &mut ViewLayout,
     target: usize,
@@ -2262,13 +2277,20 @@ fn render_list_view(
         return;
     }
 
-    let header = Row::new(["Status", "Name", "24 Hours", "7 Days", "14 Days"])
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .bottom_margin(1);
+    let header = Row::new([
+        "Status",
+        "Name",
+        "Failing Steps",
+        "24 Hours",
+        "7 Days",
+        "14 Days",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
     let rows = workflows.iter().map(|workflow| {
         if loading_status_ids.contains(&workflow.id) {
             return Row::new([
@@ -2277,11 +2299,13 @@ fn render_list_view(
                 Cell::from("loading..."),
                 Cell::from("loading..."),
                 Cell::from("loading..."),
+                Cell::from("loading..."),
             ]);
         }
         Row::new([
             Cell::from(status_indicator(workflow, flash_visible)),
             Cell::from(workflow.name.as_str()),
+            Cell::from(workflow.failing_steps.as_deref().unwrap_or("-")),
             metrics_cell(workflow.run_metrics.last_24_hours),
             metrics_cell(workflow.run_metrics.last_7_days),
             metrics_cell(workflow.run_metrics.last_14_days),
@@ -2292,6 +2316,7 @@ fn render_list_view(
         [
             Constraint::Length(8),
             Constraint::Min(20),
+            Constraint::Min(24),
             Constraint::Length(19),
             Constraint::Length(19),
             Constraint::Length(19),
@@ -3027,6 +3052,8 @@ mod tests {
             run_status: RunStatus::Other,
             is_in_progress: false,
             run_metrics: crate::github::RunMetrics::default(),
+            last_completed_run_id: None,
+            failing_steps: None,
         }
     }
 
@@ -3644,6 +3671,8 @@ mod tests {
     fn refresh_command_updates_current_workflows_in_background() {
         let mut app = app(2);
         app.workflows[0].name = "Stale Workflow".to_owned();
+        app.workflows[0].last_completed_run_id = Some(42);
+        app.workflows[0].failing_steps = Some("Build".to_owned());
         app.select_next(1);
 
         enter_command(&mut app, "refresh");
@@ -3655,6 +3684,8 @@ mod tests {
         complete_loading(&mut app);
 
         assert_eq!(app.workflows[0].name, "Refreshed Workflow 0");
+        assert_eq!(app.workflows[0].last_completed_run_id, Some(42));
+        assert_eq!(app.workflows[0].failing_steps.as_deref(), Some("Build"));
         assert_eq!(app.active_tab().table_state.selected(), Some(1));
         assert_eq!(app.message.as_deref(), Some("2 workflows refreshed"));
     }
