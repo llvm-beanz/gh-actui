@@ -100,6 +100,7 @@ to execute a command or Escape to return to Normal mode.
 | `Ctrl-u` or Page Up | Move backward up to 10 workflows |
 | `gg` or Home | Select the first workflow |
 | `G` or End | Select the last workflow |
+| Enter | Open the selected workflow's run history in a new tab |
 | `Ctrl+Tab` | Switch to the next tab |
 | `Ctrl+Shift+Tab` | Switch to the previous tab |
 | `Ctrl-w`, then an arrow or `h`/`j`/`k`/`l` | Focus the split view in that direction |
@@ -253,6 +254,24 @@ tab's workflow subset and replaces its results in place. It does not create
 another tab. Automatic interval refreshes continue to update the shared
 workflow and run data only; they do not repeatedly download triage jobs and
 logs.
+
+### Workflow details
+
+Press Enter on a workflow to open an ephemeral detail tab. Its top quarter
+summarizes the last 24 hours, 7 days, and 14 days with pass, fail, and other
+rates plus average duration and average queue time. Result rates and duration
+averages include completed runs only; queue averages include every run that
+started. Each period is based on when the run was created.
+
+The lower table lists every run fetched from the 14-day metrics window, with a
+colored status indicator, start time in UTC, and duration. Successful runs use
+🟢, failed runs use 🔴, and all other conclusions or active states use ⚪.
+Active run durations continue from their start time; queued runs that have not
+started display `-`.
+
+Use the normal `j`/`k`, arrow, paging, and jump bindings to navigate runs.
+`:refresh` reloads the run table. Workflow detail tabs cannot be split and,
+like triage tabs, are not included in saved session state.
 
 ### Filtering and sorting
 

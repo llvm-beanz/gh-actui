@@ -70,6 +70,32 @@ struct WorkflowRunPage {
     workflow_runs: Vec<WorkflowRun>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct WorkflowRunDetail {
+    pub id: u64,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub run_started_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkflowRunDetail {
+    pub fn duration(&self, now: DateTime<Utc>) -> Option<Duration> {
+        self.run_started_at.map(|started| {
+            if self.status == "completed" {
+                self.updated_at - started
+            } else {
+                now - started
+            }
+        })
+    }
+
+    pub fn queue_duration(&self) -> Option<Duration> {
+        self.run_started_at.map(|started| started - self.created_at)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkflowRun {
     id: Option<u64>,
@@ -137,6 +163,13 @@ pub enum Error {
 
 pub trait WorkflowSource: Send + Sync {
     fn list_workflows(&self, repository: &Repository) -> Result<Vec<Workflow>, Error>;
+    fn list_workflow_runs(
+        &self,
+        _repository: &Repository,
+        _workflow: &Workflow,
+    ) -> Result<Vec<WorkflowRunDetail>, Error> {
+        Ok(Vec::new())
+    }
     fn load_workflow_status(
         &self,
         _repository: &Repository,
@@ -208,6 +241,17 @@ impl WorkflowSource for GhWorkflowSource {
         workflow.is_in_progress = summary.is_in_progress;
         workflow.run_metrics = summary.run_metrics;
         Ok(workflow)
+    }
+
+    fn list_workflow_runs(
+        &self,
+        repository: &Repository,
+        workflow: &Workflow,
+    ) -> Result<Vec<WorkflowRunDetail>, Error> {
+        let runs_path = repository.workflow_runs_api_path(workflow.id);
+        fetch_workflow_run_details_with(&runs_path, Utc::now(), |path| {
+            successful_stdout(run_gh(&["api", "-X", "GET", path])?)
+        })
     }
 
     fn triage_workflows(
@@ -384,6 +428,37 @@ fn parse_workflows(response: &[u8]) -> Result<Vec<Workflow>, Error> {
         .flat_map(|page| page.workflows)
         .filter(|workflow| workflow.state == "active")
         .collect())
+}
+
+fn parse_workflow_run_details(response: &[u8]) -> Result<Vec<WorkflowRunDetail>, Error> {
+    #[derive(Deserialize)]
+    struct DetailPage {
+        workflow_runs: Vec<WorkflowRunDetail>,
+    }
+
+    Ok(serde_json::from_slice::<DetailPage>(response)?.workflow_runs)
+}
+
+fn fetch_workflow_run_details_with(
+    runs_path: &str,
+    now: DateTime<Utc>,
+    mut fetch_page: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<Vec<WorkflowRunDetail>, Error> {
+    let cutoff = now - Duration::days(14);
+    let mut runs = Vec::new();
+    let mut page_number = 1;
+    loop {
+        let page =
+            parse_workflow_run_details(&fetch_page(&format!("{runs_path}&page={page_number}"))?)?;
+        let page_len = page.len();
+        let reached_cutoff = page.iter().any(|run| run.created_at < cutoff);
+        runs.extend(page.into_iter().filter(|run| run.created_at >= cutoff));
+        if page_len < RUNS_PER_PAGE || reached_cutoff {
+            break;
+        }
+        page_number += 1;
+    }
+    Ok(runs)
 }
 
 /// Summarize a workflow's recent runs, paging only as far as the cache allows.
@@ -920,6 +995,116 @@ mod tests {
         let error = parse_workflows(br#"{"workflows":[]}"#).unwrap_err();
 
         assert!(matches!(error, Error::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn parse_workflow_run_details_includes_timing_and_status() {
+        let response = br#"{
+            "workflow_runs":[{
+                "id":42,
+                "status":"completed",
+                "conclusion":"success",
+                "created_at":"2026-09-23T10:59:00Z",
+                "run_started_at":"2026-09-23T11:00:00Z",
+                "updated_at":"2026-09-23T11:02:30Z"
+            }]
+        }"#;
+
+        let runs = parse_workflow_run_details(response).unwrap();
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
+        assert_eq!(runs[0].duration(now()), Some(Duration::seconds(150)));
+    }
+
+    #[test]
+    fn workflow_run_detail_uses_current_time_for_active_run_duration() {
+        let run = WorkflowRunDetail {
+            id: 42,
+            status: "in_progress".to_owned(),
+            conclusion: None,
+            created_at: now() - Duration::minutes(3),
+            run_started_at: Some(now() - Duration::minutes(2)),
+            updated_at: now() - Duration::minutes(1),
+        };
+
+        assert_eq!(run.status, "in_progress");
+        assert_eq!(run.duration(now()), Some(Duration::minutes(2)));
+    }
+
+    #[test]
+    fn workflow_run_detail_has_no_duration_before_starting() {
+        let run = WorkflowRunDetail {
+            id: 42,
+            status: "queued".to_owned(),
+            conclusion: None,
+            created_at: now(),
+            run_started_at: None,
+            updated_at: now(),
+        };
+
+        assert_eq!(run.duration(now()), None);
+    }
+
+    #[test]
+    fn workflow_run_detail_queue_duration_measures_created_to_started() {
+        let run = WorkflowRunDetail {
+            id: 42,
+            status: "completed".to_owned(),
+            conclusion: Some("success".to_owned()),
+            created_at: now() - Duration::minutes(5),
+            run_started_at: Some(now() - Duration::minutes(3)),
+            updated_at: now(),
+        };
+
+        assert_eq!(run.queue_duration(), Some(Duration::minutes(2)));
+    }
+
+    #[test]
+    fn fetch_workflow_run_details_pages_through_fourteen_day_window() {
+        let recent = (0..RUNS_PER_PAGE)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": (now() - Duration::hours(1)).to_rfc3339(),
+                    "run_started_at": (now() - Duration::hours(1)).to_rfc3339(),
+                    "updated_at": now().to_rfc3339()
+                })
+            })
+            .collect::<Vec<_>>();
+        let older = vec![
+            json!({
+                "id": 100,
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": (now() - Duration::days(10)).to_rfc3339(),
+                "run_started_at": (now() - Duration::days(10)).to_rfc3339(),
+                "updated_at": (now() - Duration::days(10) + Duration::minutes(1)).to_rfc3339()
+            }),
+            json!({
+                "id": 101,
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": (now() - Duration::days(15)).to_rfc3339(),
+                "run_started_at": (now() - Duration::days(15)).to_rfc3339(),
+                "updated_at": (now() - Duration::days(15) + Duration::minutes(1)).to_rfc3339()
+            }),
+        ];
+        let mut pages = VecDeque::from([
+            serde_json::to_vec(&json!({"workflow_runs": recent})).unwrap(),
+            serde_json::to_vec(&json!({"workflow_runs": older})).unwrap(),
+        ]);
+
+        let runs = fetch_workflow_run_details_with("runs?per_page=100", now(), |_| {
+            Ok(pages.pop_front().unwrap())
+        })
+        .unwrap();
+
+        assert_eq!(runs.len(), RUNS_PER_PAGE + 1);
+        assert_eq!(runs.last().unwrap().id, 100);
+        assert!(pages.is_empty());
     }
 
     #[test]

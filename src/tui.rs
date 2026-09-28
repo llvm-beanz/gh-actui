@@ -28,7 +28,8 @@ use ratatui::{
 
 use crate::{
     github::{
-        MAX_CONCURRENT_REQUESTS, RunCounts, RunStatus, Workflow, WorkflowSource, WorkflowTriage,
+        MAX_CONCURRENT_REQUESTS, RunCounts, RunStatus, Workflow, WorkflowRunDetail, WorkflowSource,
+        WorkflowTriage,
     },
     query::{FilterExpression, SortSpec, select_workflows},
     repository::Repository,
@@ -142,6 +143,9 @@ struct Tab {
     layout: ViewLayout,
     active_view: usize,
     is_triage: bool,
+    details_workflow_id: Option<u64>,
+    runs: Vec<WorkflowRunDetail>,
+    run_table_state: TableState,
 }
 
 impl Tab {
@@ -157,6 +161,9 @@ impl Tab {
             layout: ViewLayout::default(),
             active_view: 0,
             is_triage: false,
+            details_workflow_id: None,
+            runs: Vec::new(),
+            run_table_state: TableState::default(),
         }
     }
 
@@ -173,6 +180,9 @@ impl Tab {
             views,
             layout: tab.layout,
             is_triage: false,
+            details_workflow_id: None,
+            runs: Vec::new(),
+            run_table_state: TableState::default(),
         }
     }
 
@@ -182,6 +192,10 @@ impl Tab {
 
     fn active_view_mut(&mut self) -> &mut ListView {
         &mut self.views[self.active_view]
+    }
+
+    fn is_ephemeral(&self) -> bool {
+        self.is_triage || self.details_workflow_id.is_some()
     }
 }
 
@@ -212,6 +226,8 @@ struct App {
     triage_receiver: Option<Receiver<Result<Vec<WorkflowTriage>, crate::github::Error>>>,
     triage_target: Option<TriageTarget>,
     triage: HashMap<u64, WorkflowTriage>,
+    run_details_receiver: Option<Receiver<Result<Vec<WorkflowRunDetail>, crate::github::Error>>>,
+    run_details_target: Option<usize>,
     tabs: Vec<Tab>,
     active_tab: usize,
     mode: Mode,
@@ -270,6 +286,8 @@ impl App {
             triage_receiver: None,
             triage_target: None,
             triage: HashMap::new(),
+            run_details_receiver: None,
+            run_details_target: None,
             tabs,
             active_tab,
             mode: Mode::Normal,
@@ -316,6 +334,7 @@ impl App {
         while !self.should_quit {
             self.poll_loading();
             self.poll_triage();
+            self.poll_run_details();
             self.refresh_if_due();
             terminal.draw(|frame| self.render(frame))?;
 
@@ -455,6 +474,43 @@ impl App {
         self.triage_receiver = None;
         let target = self.triage_target.take();
         self.finish_triage(result.map_err(|error| error.to_string()), target);
+    }
+
+    fn poll_run_details(&mut self) {
+        let Some(receiver) = self.run_details_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.run_details_receiver = None;
+                self.run_details_target = None;
+                self.message = Some("E484: workflow run loading stopped unexpectedly".to_owned());
+                return;
+            }
+        };
+        self.run_details_receiver = None;
+        let target = self.run_details_target.take();
+        match (result, target) {
+            (Ok(runs), Some(index))
+                if self
+                    .tabs
+                    .get(index)
+                    .is_some_and(|tab| tab.details_workflow_id.is_some()) =>
+            {
+                let count = runs.len();
+                let tab = &mut self.tabs[index];
+                tab.runs = runs;
+                tab.run_table_state.select((count > 0).then_some(0));
+                self.message = Some(format!("{count} workflow runs loaded"));
+            }
+            (Ok(_), _) => {
+                self.message =
+                    Some("E484: workflow detail destination is no longer available".to_owned());
+            }
+            (Err(error), _) => self.message = Some(format!("E484: {error}")),
+        }
     }
 
     fn finish_triage(
@@ -735,6 +791,7 @@ impl App {
     fn refresh_if_due(&mut self) {
         if !self.is_loading()
             && self.triage_receiver.is_none()
+            && self.run_details_receiver.is_none()
             && Instant::now() >= self.next_refresh
         {
             self.refresh_workflows();
@@ -744,13 +801,18 @@ impl App {
     fn refresh(&mut self) {
         if self.active_tab().is_triage {
             self.refresh_triage();
+        } else if self.active_tab().details_workflow_id.is_some() {
+            self.refresh_run_details(self.active_tab);
         } else {
             self.refresh_workflows();
         }
     }
 
     fn refresh_workflows(&mut self) {
-        if self.is_loading() || self.triage_receiver.is_some() {
+        if self.is_loading()
+            || self.triage_receiver.is_some()
+            || self.run_details_receiver.is_some()
+        {
             self.message = Some("Triage or refresh already in progress".to_owned());
             return;
         }
@@ -775,6 +837,8 @@ impl App {
                 " TRIAGING ",
                 "Analyzing scheduled failures, jobs, steps, and logs...".to_owned(),
             )
+        } else if self.run_details_receiver.is_some() {
+            (" LOADING ", "Loading previous workflow runs...".to_owned())
         } else if let Some(pending) = self.pending_load.as_ref() {
             let action = match pending.kind {
                 LoadKind::Refresh => "Refreshing",
@@ -881,6 +945,7 @@ impl App {
                 self.pending_g = true;
                 return;
             }
+            KeyCode::Enter => self.open_workflow_details(),
             KeyCode::Char(':') => {
                 self.mode = Mode::Command;
                 self.command.clear();
@@ -1135,7 +1200,7 @@ impl App {
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, tab)| !tab.is_triage)
+            .filter(|(_, tab)| !tab.is_ephemeral())
             .map(|(index, tab)| {
                 let persisted_views = tab
                     .views
@@ -1284,8 +1349,8 @@ impl App {
     }
 
     fn split_view(&mut self, argument: Option<&str>) {
-        if self.active_tab().is_triage {
-            self.message = Some("E474: Triage views cannot be split".to_owned());
+        if self.active_tab().is_ephemeral() {
+            self.message = Some("E474: Detail views cannot be split".to_owned());
             return;
         }
         let direction = match argument {
@@ -1361,8 +1426,8 @@ impl App {
     }
 
     fn equalize_splits(&mut self) {
-        if self.active_tab().is_triage {
-            self.message = Some("E474: Triage views cannot be resized".to_owned());
+        if self.active_tab().is_ephemeral() {
+            self.message = Some("E474: Detail views cannot be resized".to_owned());
             return;
         }
         equalize_layout(&mut self.active_tab_mut().layout);
@@ -1370,8 +1435,8 @@ impl App {
     }
 
     fn resize_active_view(&mut self, axis: ResizeAxis, amount: ResizeAmount) {
-        if self.active_tab().is_triage {
-            self.message = Some("E474: Triage views cannot be resized".to_owned());
+        if self.active_tab().is_ephemeral() {
+            self.message = Some("E474: Detail views cannot be resized".to_owned());
             return;
         }
         let active = self.active_tab().active_view;
@@ -1439,6 +1504,61 @@ impl App {
         self.tabs.insert(self.active_tab + 1, tab);
         self.active_tab += 1;
         self.message = Some(format!("{} opened", self.active_tab_label()));
+    }
+
+    fn open_workflow_details(&mut self) {
+        if self.active_tab().is_ephemeral() || self.run_details_receiver.is_some() {
+            return;
+        }
+        let Some(workflow) = self
+            .active_view()
+            .table_state
+            .selected()
+            .and_then(|selected| self.visible_workflows().get(selected).copied())
+            .cloned()
+        else {
+            self.message = Some("E749: Empty buffer".to_owned());
+            return;
+        };
+
+        let mut tab = Tab::new(Some(workflow.name.clone()), vec![workflow.id], None, None);
+        tab.details_workflow_id = Some(workflow.id);
+        let index = self.active_tab + 1;
+        self.tabs.insert(index, tab);
+        self.active_tab = index;
+        self.load_run_details(index, workflow);
+    }
+
+    fn refresh_run_details(&mut self, index: usize) {
+        let Some(workflow_id) = self.tabs.get(index).and_then(|tab| tab.details_workflow_id) else {
+            return;
+        };
+        let Some(workflow) = self
+            .workflows
+            .iter()
+            .find(|workflow| workflow.id == workflow_id)
+            .cloned()
+        else {
+            self.message = Some("E484: Workflow is no longer available".to_owned());
+            return;
+        };
+        self.load_run_details(index, workflow);
+    }
+
+    fn load_run_details(&mut self, target: usize, workflow: Workflow) {
+        if self.run_details_receiver.is_some() {
+            self.message = Some("Workflow runs are already loading".to_owned());
+            return;
+        }
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.list_workflow_runs(&repository, &workflow));
+        });
+        self.run_details_receiver = Some(receiver);
+        self.run_details_target = Some(target);
+        self.message = None;
     }
 
     fn start_triage(&mut self) {
@@ -1594,6 +1714,16 @@ impl App {
     }
 
     fn select_next(&mut self, amount: usize) {
+        if self.active_tab().details_workflow_id.is_some() {
+            let count = self.active_tab().runs.len();
+            if count > 0 {
+                let current = self.active_tab().run_table_state.selected().unwrap_or(0);
+                self.active_tab_mut()
+                    .run_table_state
+                    .select(Some((current + amount).min(count - 1)));
+            }
+            return;
+        }
         let visible_count = self.visible_workflows().len();
         if visible_count == 0 {
             return;
@@ -1606,6 +1736,13 @@ impl App {
     }
 
     fn select_previous(&mut self, amount: usize) {
+        if self.active_tab().details_workflow_id.is_some() {
+            let current = self.active_tab().run_table_state.selected().unwrap_or(0);
+            self.active_tab_mut()
+                .run_table_state
+                .select(Some(current.saturating_sub(amount)));
+            return;
+        }
         if self.visible_workflows().is_empty() {
             return;
         }
@@ -1617,12 +1754,27 @@ impl App {
     }
 
     fn select_first(&mut self) {
+        if self.active_tab().details_workflow_id.is_some() {
+            if !self.active_tab().runs.is_empty() {
+                self.active_tab_mut().run_table_state.select(Some(0));
+            }
+            return;
+        }
         if !self.visible_workflows().is_empty() {
             self.active_view_mut().table_state.select(Some(0));
         }
     }
 
     fn select_last(&mut self) {
+        if self.active_tab().details_workflow_id.is_some() {
+            let count = self.active_tab().runs.len();
+            if count > 0 {
+                self.active_tab_mut()
+                    .run_table_state
+                    .select(Some(count - 1));
+            }
+            return;
+        }
         let visible_count = self.visible_workflows().len();
         if visible_count > 0 {
             self.active_view_mut()
@@ -1694,6 +1846,31 @@ impl App {
             } else {
                 self.render_triage_blocks(frame, table_area, &visible_workflows);
             }
+        } else if self.active_tab().details_workflow_id.is_some() {
+            self.pane_areas.push((0, table_area));
+            let loading = self.run_details_receiver.is_some()
+                && self.run_details_target == Some(self.active_tab);
+            let repository = self.repository.clone();
+            let workflow_name = self
+                .active_tab()
+                .name
+                .as_deref()
+                .unwrap_or("Workflow")
+                .to_owned();
+            let [summary_area, runs_area] =
+                Layout::vertical([Constraint::Percentage(25), Constraint::Percentage(75)])
+                    .areas(table_area);
+            let tab = &mut self.tabs[self.active_tab];
+            render_workflow_run_summary(frame, summary_area, &tab.runs);
+            render_workflow_runs(
+                frame,
+                runs_area,
+                &repository,
+                &workflow_name,
+                &tab.runs,
+                &mut tab.run_table_state,
+                loading,
+            );
         } else {
             let pane_areas = layout_areas(&self.active_tab().layout, table_area);
             self.pane_areas.clone_from(&pane_areas);
@@ -2131,6 +2308,209 @@ fn render_list_view(
     frame.render_stateful_widget(table, area, table_state);
 }
 
+fn render_workflow_runs(
+    frame: &mut Frame,
+    area: Rect,
+    repository: &Repository,
+    workflow_name: &str,
+    runs: &[WorkflowRunDetail],
+    table_state: &mut TableState,
+    loading: bool,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(format!(" {repository} - {workflow_name} "));
+    if runs.is_empty() {
+        let message = if loading {
+            "Loading previous workflow runs..."
+        } else {
+            "This workflow has no previous runs."
+        };
+        frame.render_widget(Paragraph::new(message).centered().block(block), area);
+        return;
+    }
+
+    let header = Row::new(["Status", "Started", "Duration"])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+    let now = chrono::Utc::now();
+    let rows = runs.iter().map(|run| {
+        Row::new([
+            Cell::from(workflow_run_status_indicator(run)),
+            Cell::from(
+                run.run_started_at
+                    .unwrap_or(run.created_at)
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string(),
+            ),
+            Cell::from(format_run_duration(run.duration(now))),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(24),
+            Constraint::Min(12),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(">> ")
+    .block(block);
+    frame.render_stateful_widget(table, area, table_state);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkflowRunPeriodMetrics {
+    passed: u64,
+    failed: u64,
+    other: u64,
+    duration_seconds: i64,
+    duration_count: u64,
+    queue_seconds: i64,
+    queue_count: u64,
+}
+
+impl WorkflowRunPeriodMetrics {
+    fn total(self) -> u64 {
+        self.passed + self.failed + self.other
+    }
+
+    fn rate(self, count: u64) -> f64 {
+        if self.total() == 0 {
+            0.0
+        } else {
+            count as f64 / self.total() as f64 * 100.0
+        }
+    }
+
+    fn average_duration(self) -> Option<chrono::Duration> {
+        (self.duration_count > 0)
+            .then(|| chrono::Duration::seconds(self.duration_seconds / self.duration_count as i64))
+    }
+
+    fn average_queue(self) -> Option<chrono::Duration> {
+        (self.queue_count > 0)
+            .then(|| chrono::Duration::seconds(self.queue_seconds / self.queue_count as i64))
+    }
+}
+
+fn workflow_run_period_metrics(
+    runs: &[WorkflowRunDetail],
+    now: chrono::DateTime<chrono::Utc>,
+    window: chrono::Duration,
+) -> WorkflowRunPeriodMetrics {
+    let mut metrics = WorkflowRunPeriodMetrics::default();
+    for run in runs
+        .iter()
+        .filter(|run| now.signed_duration_since(run.created_at) <= window)
+    {
+        if let Some(queue) = run.queue_duration() {
+            metrics.queue_seconds += queue.num_seconds().max(0);
+            metrics.queue_count += 1;
+        }
+        if run.status != "completed" {
+            continue;
+        }
+        match run.conclusion.as_deref() {
+            Some("success") => metrics.passed += 1,
+            Some("failure") => metrics.failed += 1,
+            _ => metrics.other += 1,
+        }
+        if let Some(duration) = run.duration(now) {
+            metrics.duration_seconds += duration.num_seconds().max(0);
+            metrics.duration_count += 1;
+        }
+    }
+    metrics
+}
+
+fn render_workflow_run_summary(frame: &mut Frame, area: Rect, runs: &[WorkflowRunDetail]) {
+    let now = chrono::Utc::now();
+    let periods = [
+        ("24 Hours", chrono::Duration::hours(24)),
+        ("7 Days", chrono::Duration::days(7)),
+        ("14 Days", chrono::Duration::days(14)),
+    ];
+    let rows = periods.into_iter().map(|(label, window)| {
+        let metrics = workflow_run_period_metrics(runs, now, window);
+        let pass_rate = metrics.rate(metrics.passed);
+        Row::new([
+            Cell::from(label),
+            Cell::from(format!(
+                "P {:.1}% / F {:.1}% / O {:.1}%",
+                pass_rate,
+                metrics.rate(metrics.failed),
+                metrics.rate(metrics.other)
+            ))
+            .style(Style::default().fg(metrics_color(pass_rate))),
+            Cell::from(format_run_duration(metrics.average_duration())),
+            Cell::from(format_run_duration(metrics.average_queue())),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Min(31),
+            Constraint::Length(16),
+            Constraint::Length(13),
+        ],
+    )
+    .header(
+        Row::new(["Period", "Pass / Fail / Other", "Avg Duration", "Avg Queue"]).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Summary and metrics "),
+    );
+    frame.render_widget(table, area);
+}
+
+fn workflow_run_status_indicator(run: &WorkflowRunDetail) -> &'static str {
+    match run.conclusion.as_deref() {
+        Some("success") => "🟢",
+        Some("failure") => "🔴",
+        _ => "⚪",
+    }
+}
+
+fn format_run_duration(duration: Option<chrono::Duration>) -> String {
+    let Some(duration) = duration else {
+        return "-".to_owned();
+    };
+    let seconds = duration.num_seconds().max(0);
+    let hours = seconds / 3600;
+    let minutes = seconds % 3600 / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn render_status_bar(
     frame: &mut Frame,
     area: Rect,
@@ -2547,6 +2927,32 @@ mod tests {
                 })
                 .collect())
         }
+
+        fn list_workflow_runs(
+            &self,
+            _repository: &Repository,
+            _workflow: &Workflow,
+        ) -> Result<Vec<WorkflowRunDetail>, crate::github::Error> {
+            let started = "2026-09-28T12:00:00Z".parse().unwrap();
+            Ok(vec![
+                WorkflowRunDetail {
+                    id: 2,
+                    status: "completed".to_owned(),
+                    conclusion: Some("success".to_owned()),
+                    created_at: started,
+                    run_started_at: Some(started),
+                    updated_at: started + chrono::Duration::minutes(3),
+                },
+                WorkflowRunDetail {
+                    id: 1,
+                    status: "queued".to_owned(),
+                    conclusion: None,
+                    created_at: started,
+                    run_started_at: None,
+                    updated_at: started,
+                },
+            ])
+        }
     }
 
     struct ProgressiveWorkflowSource;
@@ -2670,6 +3076,23 @@ mod tests {
         app.triage_receiver = None;
         let target = app.triage_target.take();
         app.finish_triage(result, target);
+    }
+
+    fn complete_run_details(app: &mut App) {
+        let result = app
+            .run_details_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        app.run_details_receiver = None;
+        let target = app.run_details_target.take().unwrap();
+        let runs = result.unwrap();
+        let count = runs.len();
+        app.tabs[target].runs = runs;
+        app.tabs[target]
+            .run_table_state
+            .select((count > 0).then_some(0));
     }
 
     #[test]
@@ -3091,6 +3514,130 @@ mod tests {
         assert_eq!(tabs[0].workflow_ids, vec![0, 1, 2]);
         assert_eq!(tabs[0].selected_workflow_id, Some(0));
         assert_eq!(active_tab, 0);
+    }
+
+    #[test]
+    fn enter_opens_ephemeral_workflow_details_with_previous_runs() {
+        let mut app = app(2);
+        app.select_next(1);
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().name.as_deref(), Some("Workflow 1"));
+        assert_eq!(app.active_tab().details_workflow_id, Some(1));
+        assert!(app.run_details_receiver.is_some());
+        assert_eq!(app.normal_status().0, " LOADING ");
+
+        complete_run_details(&mut app);
+
+        assert_eq!(app.active_tab().runs.len(), 2);
+        assert_eq!(
+            app.active_tab().runs[0].conclusion.as_deref(),
+            Some("success")
+        );
+        assert_eq!(app.active_tab().run_table_state.selected(), Some(0));
+        let (tabs, active_tab) = app.persisted_tabs();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(active_tab, 0);
+    }
+
+    #[test]
+    fn workflow_detail_navigation_uses_run_rows() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+
+        app.select_next(1);
+        assert_eq!(app.active_tab().run_table_state.selected(), Some(1));
+        app.select_previous(1);
+        assert_eq!(app.active_tab().run_table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn format_run_duration_formats_elapsed_time() {
+        assert_eq!(
+            format_run_duration(Some(chrono::Duration::seconds(3_725))),
+            "1h 02m 05s"
+        );
+        assert_eq!(
+            format_run_duration(Some(chrono::Duration::seconds(125))),
+            "2m 05s"
+        );
+        assert_eq!(format_run_duration(None), "-");
+    }
+
+    #[test]
+    fn workflow_run_status_indicator_uses_colored_balls() {
+        let started = "2026-09-28T12:00:00Z".parse().unwrap();
+        let mut run = WorkflowRunDetail {
+            id: 1,
+            status: "completed".to_owned(),
+            conclusion: Some("success".to_owned()),
+            created_at: started,
+            run_started_at: Some(started),
+            updated_at: started,
+        };
+
+        assert_eq!(workflow_run_status_indicator(&run), "🟢");
+        run.conclusion = Some("failure".to_owned());
+        assert_eq!(workflow_run_status_indicator(&run), "🔴");
+        run.conclusion = Some("cancelled".to_owned());
+        assert_eq!(workflow_run_status_indicator(&run), "⚪");
+        run.status = "in_progress".to_owned();
+        run.conclusion = None;
+        assert_eq!(workflow_run_status_indicator(&run), "⚪");
+    }
+
+    #[test]
+    fn workflow_run_period_metrics_computes_rates_and_averages() {
+        let now = "2026-09-28T12:00:00Z".parse().unwrap();
+        let make_run = |id: u64,
+                        age_minutes: i64,
+                        status: &str,
+                        conclusion: Option<&str>,
+                        queue: Option<i64>,
+                        duration: i64| {
+            let created_at = now - chrono::Duration::minutes(age_minutes);
+            let run_started_at =
+                queue.map(|seconds| created_at + chrono::Duration::seconds(seconds));
+            WorkflowRunDetail {
+                id,
+                status: status.to_owned(),
+                conclusion: conclusion.map(str::to_owned),
+                created_at,
+                run_started_at,
+                updated_at: run_started_at
+                    .map(|started| started + chrono::Duration::seconds(duration))
+                    .unwrap_or(created_at),
+            }
+        };
+        let runs = vec![
+            make_run(1, 60, "completed", Some("success"), Some(10), 50),
+            make_run(2, 120, "completed", Some("failure"), Some(30), 70),
+            make_run(3, 180, "completed", Some("cancelled"), None, 0),
+            make_run(4, 30, "in_progress", None, Some(20), 0),
+            make_run(
+                5,
+                15 * 24 * 60,
+                "completed",
+                Some("success"),
+                Some(100),
+                100,
+            ),
+        ];
+
+        let metrics = workflow_run_period_metrics(&runs, now, chrono::Duration::days(14));
+
+        assert_eq!(metrics.passed, 1);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.other, 1);
+        assert!((metrics.rate(metrics.passed) - 100.0 / 3.0).abs() < 1e-10);
+        assert_eq!(
+            metrics.average_duration(),
+            Some(chrono::Duration::seconds(60))
+        );
+        assert_eq!(metrics.average_queue(), Some(chrono::Duration::seconds(20)));
     }
 
     #[test]
