@@ -6,3 +6,5 @@
 
 # Debug symbols generated on Windows
 *.pdb
+
+.vscode/
