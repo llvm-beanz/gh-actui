@@ -126,6 +126,7 @@ pub struct WorkflowTriage {
     pub workflow_id: u64,
     pub failed_jobs: String,
     pub failed_steps: String,
+    pub build_diagnostics: Vec<String>,
     pub failed_tests: Vec<String>,
     pub unexpectedly_passed_tests: Vec<String>,
     pub lit_summary: String,
@@ -149,6 +150,7 @@ struct Job {
 struct JobStep {
     name: String,
     conclusion: Option<String>,
+    started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]
@@ -315,7 +317,7 @@ impl WorkflowSource for GhWorkflowSource {
         workflow: &Workflow,
         run_id: u64,
     ) -> Result<WorkflowTriage, Error> {
-        build_run_triage(repository, workflow.id, run_id)
+        build_run_triage(repository, workflow.id, run_id, true)
     }
 
     fn flush(&self) {
@@ -691,15 +693,22 @@ fn triage_workflow(
     let Some(run_id) = find_failed_scheduled_run(&runs_path)? else {
         return Ok(None);
     };
-    Ok(Some(build_run_triage(repository, workflow.id, run_id)?))
+    Ok(Some(build_run_triage(
+        repository,
+        workflow.id,
+        run_id,
+        false,
+    )?))
 }
 
 fn build_run_triage(
     repository: &Repository,
     workflow_id: u64,
     run_id: u64,
+    include_build_diagnostics: bool,
 ) -> Result<WorkflowTriage, Error> {
-    let failures = fetch_failed_jobs(repository, run_id)?;
+    let jobs = fetch_jobs(repository, run_id)?;
+    let failures = failed_jobs(&jobs);
     let failed_jobs = failures
         .iter()
         .map(|failure| failure.job_name.as_str())
@@ -713,13 +722,36 @@ fn build_run_triage(
     let mut summaries = Vec::new();
     let mut failed_tests = Vec::new();
     let mut unexpectedly_passed_tests = Vec::new();
+    let mut build_diagnostics = Vec::new();
+    let mut logs = BTreeMap::new();
+    if include_build_diagnostics {
+        let lit_started_at = jobs
+            .iter()
+            .flat_map(|job| &job.steps)
+            .filter(|step| step.name == "Run HLSL Tests")
+            .filter_map(|step| step.started_at)
+            .min();
+        for job in jobs
+            .iter()
+            .filter(|job| job.conclusion.as_deref() != Some("skipped") && !job.steps.is_empty())
+        {
+            let log = fetch_job_log(repository, job.id)?;
+            for diagnostic in extract_build_diagnostics(&log, lit_started_at) {
+                if !build_diagnostics.contains(&diagnostic) {
+                    build_diagnostics.push(diagnostic);
+                }
+            }
+            logs.insert(job.id, log);
+        }
+    }
     for failure in failures
         .iter()
         .filter(|failure| failure.step_name.as_deref() == Some("Run HLSL Tests"))
     {
-        let path = repository.job_logs_api_path(failure.job_id);
-        let log = successful_stdout(run_gh(&["api", &path])?)?;
-        let log = String::from_utf8_lossy(&log);
+        let log = match logs.get(&failure.job_id) {
+            Some(log) => log.clone(),
+            None => fetch_job_log(repository, failure.job_id)?,
+        };
         let (job_failed_tests, job_unexpectedly_passed_tests) = extract_lit_test_names(&log);
         failed_tests.extend(job_failed_tests);
         unexpectedly_passed_tests.extend(job_unexpectedly_passed_tests);
@@ -744,6 +776,7 @@ fn build_run_triage(
         } else {
             failed_steps
         },
+        build_diagnostics,
         failed_tests,
         unexpectedly_passed_tests,
         lit_summary: summaries.join("\n\n"),
@@ -837,8 +870,7 @@ struct FailedJob {
     step_name: Option<String>,
 }
 
-fn fetch_failed_jobs(repository: &Repository, run_id: u64) -> Result<Vec<FailedJob>, Error> {
-    let jobs = fetch_jobs(repository, run_id)?;
+fn failed_jobs(jobs: &[Job]) -> Vec<FailedJob> {
     let mut failures = Vec::new();
     for job in jobs {
         if matches!(
@@ -847,7 +879,7 @@ fn fetch_failed_jobs(repository: &Repository, run_id: u64) -> Result<Vec<FailedJ
         ) {
             continue;
         }
-        let failed_step = job.steps.into_iter().find(|step| {
+        let failed_step = job.steps.iter().find(|step| {
             !matches!(
                 step.conclusion.as_deref(),
                 None | Some("success" | "skipped")
@@ -855,11 +887,11 @@ fn fetch_failed_jobs(repository: &Repository, run_id: u64) -> Result<Vec<FailedJ
         });
         failures.push(FailedJob {
             job_id: job.id,
-            job_name: job.name,
-            step_name: failed_step.map(|step| step.name),
+            job_name: job.name.clone(),
+            step_name: failed_step.map(|step| step.name.clone()),
         });
     }
-    Ok(failures)
+    failures
 }
 
 fn fetch_failed_step_names(repository: &Repository, run_id: u64) -> Result<Vec<String>, Error> {
@@ -896,6 +928,68 @@ fn fetch_jobs(repository: &Repository, run_id: u64) -> Result<Vec<Job>, Error> {
         page_number += 1;
     }
     Ok(jobs)
+}
+
+fn fetch_job_log(repository: &Repository, job_id: u64) -> Result<String, Error> {
+    let path = repository.job_logs_api_path(job_id);
+    let log = successful_stdout(run_gh(&["api", &path])?)?;
+    Ok(String::from_utf8_lossy(&log).into_owned())
+}
+
+fn extract_build_diagnostics(log: &str, lit_started_at: Option<DateTime<Utc>>) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    for raw_line in log.lines() {
+        let (timestamp, line) = split_log_timestamp(raw_line);
+        if line.contains("Run HLSL Tests")
+            || timestamp
+                .zip(lit_started_at)
+                .is_some_and(|(timestamp, started)| timestamp >= started)
+        {
+            break;
+        }
+        let line = line.trim();
+        if is_compiler_or_linker_diagnostic(line) {
+            let diagnostic = line
+                .strip_prefix("##[error]")
+                .or_else(|| line.strip_prefix("##[warning]"))
+                .unwrap_or(line)
+                .trim()
+                .to_owned();
+            if !diagnostics.contains(&diagnostic) {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+    diagnostics
+}
+
+fn is_compiler_or_linker_diagnostic(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains(": warning:")
+        || lower.contains(": error:")
+        || lower.contains(": fatal error:")
+        || lower.contains(": warning c")
+        || lower.contains(": error c")
+        || lower.contains(": fatal error c")
+        || lower.contains(": warning lnk")
+        || lower.contains(": error lnk")
+        || lower.contains(": fatal error lnk")
+        || lower.starts_with("warning:")
+        || lower.starts_with("error:")
+        || lower.starts_with("error[")
+        || lower.contains("undefined reference")
+        || lower.contains("multiple definition")
+        || lower.contains("unresolved external symbol")
+        || lower.contains("collect2: error:")
+}
+
+fn split_log_timestamp(line: &str) -> (Option<DateTime<Utc>>, &str) {
+    let (prefix, remainder) = line.split_once(' ').unwrap_or((line, ""));
+    let timestamp = prefix.parse::<DateTime<Utc>>().ok();
+    (
+        timestamp,
+        if timestamp.is_some() { remainder } else { line },
+    )
 }
 
 fn extract_lit_summary(log: &str) -> Option<String> {
@@ -939,16 +1033,7 @@ fn extract_lit_summary(log: &str) -> Option<String> {
 }
 
 fn strip_log_timestamp(line: &str) -> &str {
-    let (prefix, remainder) = line.split_once(' ').unwrap_or((line, ""));
-    if prefix.len() >= 20
-        && prefix.as_bytes().get(4) == Some(&b'-')
-        && prefix.as_bytes().get(7) == Some(&b'-')
-        && prefix.ends_with('Z')
-    {
-        remainder
-    } else {
-        line
-    }
+    split_log_timestamp(line).1
 }
 
 fn extract_lit_test_names(log: &str) -> (Vec<String>, Vec<String>) {
@@ -1245,14 +1330,17 @@ mod tests {
                     JobStep {
                         name: "Checkout".to_owned(),
                         conclusion: Some("success".to_owned()),
+                        started_at: None,
                     },
                     JobStep {
                         name: "Build".to_owned(),
                         conclusion: Some("failure".to_owned()),
+                        started_at: None,
                     },
                     JobStep {
                         name: "Test".to_owned(),
                         conclusion: Some("failure".to_owned()),
+                        started_at: None,
                     },
                 ],
             },
@@ -1264,10 +1352,12 @@ mod tests {
                     JobStep {
                         name: "Build".to_owned(),
                         conclusion: Some("failure".to_owned()),
+                        started_at: None,
                     },
                     JobStep {
                         name: "Cleanup".to_owned(),
                         conclusion: Some("cancelled".to_owned()),
+                        started_at: None,
                     },
                 ],
             },
@@ -1937,6 +2027,54 @@ mod tests {
         assert_eq!(
             extract_lit_summary(log).as_deref(),
             Some("Failed Tests (2):\n  Suite :: one.test\n  Suite :: two.test")
+        );
+    }
+
+    #[test]
+    fn build_diagnostics_recognizes_compiler_and_linker_formats() {
+        let log = "\
+2026-09-23T10:00:00Z src/main.cpp:10:5: warning: unused variable 'value'\n\
+2026-09-23T10:00:01Z src/main.cpp:11:5: error: unknown identifier\n\
+2026-09-23T10:00:02Z main.cpp(12): warning C4101: unreferenced local variable\n\
+2026-09-23T10:00:03Z LINK : fatal error LNK1120: 1 unresolved externals\n\
+2026-09-23T10:00:04Z lib.o: undefined reference to `missing_symbol'\n\
+2026-09-23T10:00:05Z ordinary build output\n";
+
+        assert_eq!(
+            extract_build_diagnostics(log, None),
+            vec![
+                "src/main.cpp:10:5: warning: unused variable 'value'",
+                "src/main.cpp:11:5: error: unknown identifier",
+                "main.cpp(12): warning C4101: unreferenced local variable",
+                "LINK : fatal error LNK1120: 1 unresolved externals",
+                "lib.o: undefined reference to `missing_symbol'",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_diagnostics_stop_at_lit_step_timestamp() {
+        let lit_started_at = "2026-09-23T10:00:03Z".parse().unwrap();
+        let log = "\
+2026-09-23T10:00:01Z build.cpp:1: warning: build warning\n\
+2026-09-23T10:00:03Z test.cpp:1: error: compiler-under-test error\n";
+
+        assert_eq!(
+            extract_build_diagnostics(log, Some(lit_started_at)),
+            vec!["build.cpp:1: warning: build warning"]
+        );
+    }
+
+    #[test]
+    fn build_diagnostics_stop_at_textual_lit_boundary_without_timestamp() {
+        let log = "\
+build.cpp:1: warning: build warning\n\
+##[group]Run HLSL Tests\n\
+test.cpp:1: error: compiler-under-test error\n";
+
+        assert_eq!(
+            extract_build_diagnostics(log, None),
+            vec!["build.cpp:1: warning: build warning"]
         );
     }
 

@@ -278,7 +278,10 @@ started display `-`.
 Use the normal `j`/`k`, arrow, paging, and jump bindings to navigate runs.
 Press Enter on a run to split the lower panel vertically. The run table remains
 on the left, while the right half loads and displays that run's failed jobs,
-failed steps, failed tests, unexpected passes, and lit summary. Selecting
+failed steps, build diagnostics, failed tests, unexpected passes, and lit
+summary. Compiler and linker warnings and errors are collected from job logs
+only for this single-run view. Collection stops when the `Run HLSL Tests` step
+starts so diagnostics from the compiler under test are excluded. Selecting
 another run and pressing Enter replaces the right-hand triage output.
 `:refresh` reloads the run table. Workflow detail tabs cannot be split and,
 like triage tabs, are not included in saved session state.

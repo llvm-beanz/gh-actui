@@ -2827,6 +2827,16 @@ fn triage_text(triage: Option<&WorkflowTriage>) -> Text<'_> {
         Line::from(format!("Failed jobs: {}", triage.failed_jobs)),
         Line::from(format!("Failed steps: {}", triage.failed_steps)),
     ];
+    if !triage.build_diagnostics.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from("Build diagnostics:").bold());
+        lines.extend(
+            triage
+                .build_diagnostics
+                .iter()
+                .map(|diagnostic| Line::from(format!("  {diagnostic}"))),
+        );
+    }
     if !triage.failed_tests.is_empty() {
         lines.push(Line::default());
         lines.push(Line::from("Failed tests:").bold());
@@ -3082,6 +3092,7 @@ mod tests {
                     workflow_id: workflow.id,
                     failed_jobs: format!("Job {}", workflow.id),
                     failed_steps: "Run HLSL Tests".to_owned(),
+                    build_diagnostics: Vec::new(),
                     failed_tests: vec!["example.test".to_owned()],
                     unexpectedly_passed_tests: Vec::new(),
                     lit_summary: "Failed Tests (1): example.test".to_owned(),
@@ -3125,6 +3136,7 @@ mod tests {
                 workflow_id: workflow.id,
                 failed_jobs: format!("Run {run_id} job"),
                 failed_steps: format!("Run {run_id} step"),
+                build_diagnostics: vec![format!("run-{run_id}.cpp:1: error: failed")],
                 failed_tests: vec![format!("run-{run_id}.test")],
                 unexpectedly_passed_tests: Vec::new(),
                 lit_summary: format!("Run {run_id} summary"),
@@ -4578,6 +4590,7 @@ mod tests {
             workflow_id: 1,
             failed_jobs: "Linux tests".to_owned(),
             failed_steps: "Run HLSL Tests".to_owned(),
+            build_diagnostics: Vec::new(),
             failed_tests: vec!["one.test".to_owned(), "two.test".to_owned()],
             unexpectedly_passed_tests: vec!["flaky.test".to_owned()],
             lit_summary: "Failed Tests (2):\n  Suite :: one.test\n  Suite :: two.test".to_owned(),
@@ -4613,6 +4626,38 @@ mod tests {
     }
 
     #[test]
+    fn triage_text_includes_build_diagnostics() {
+        let triage = WorkflowTriage {
+            workflow_id: 1,
+            failed_jobs: "Build".to_owned(),
+            failed_steps: "Compile".to_owned(),
+            build_diagnostics: vec![
+                "source.cpp:10: warning: unused variable".to_owned(),
+                "link.exe : error LNK1120: 1 unresolved externals".to_owned(),
+            ],
+            failed_tests: Vec::new(),
+            unexpectedly_passed_tests: Vec::new(),
+            lit_summary: String::new(),
+        };
+
+        assert_eq!(
+            triage_text(Some(&triage))
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "Failed jobs: Build",
+                "Failed steps: Compile",
+                "",
+                "Build diagnostics:",
+                "  source.cpp:10: warning: unused variable",
+                "  link.exe : error LNK1120: 1 unresolved externals",
+            ]
+        );
+    }
+
+    #[test]
     fn triage_summary_correlates_tests_across_workflows() {
         let workflows = vec![workflow(1), workflow(2), workflow(3)];
         let mut triage = HashMap::new();
@@ -4622,6 +4667,7 @@ mod tests {
                 workflow_id: 1,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "\
@@ -4639,6 +4685,7 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 2,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "\
@@ -4655,6 +4702,7 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 3,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "Failed Tests (1):\n  Suite :: another-unique.test".to_owned(),
@@ -4681,6 +4729,7 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 1,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
                 lit_summary: "Failed Tests (1):\n  Suite :: unique.test".to_owned(),
@@ -4703,6 +4752,7 @@ Unexpectedly Passed Tests (1):
                     workflow_id: 1,
                     failed_jobs: String::new(),
                     failed_steps: String::new(),
+                    build_diagnostics: Vec::new(),
                     failed_tests: vec!["shared-failure.test".to_owned()],
                     unexpectedly_passed_tests: vec!["shared-xpass.test".to_owned()],
                     lit_summary: String::new(),
@@ -4714,6 +4764,7 @@ Unexpectedly Passed Tests (1):
                     workflow_id: 2,
                     failed_jobs: String::new(),
                     failed_steps: String::new(),
+                    build_diagnostics: Vec::new(),
                     failed_tests: vec!["shared-failure.test".to_owned(), "unique.test".to_owned()],
                     unexpectedly_passed_tests: vec!["shared-xpass.test".to_owned()],
                     lit_summary: String::new(),
@@ -4725,6 +4776,7 @@ Unexpectedly Passed Tests (1):
                     workflow_id: 3,
                     failed_jobs: String::new(),
                     failed_steps: String::new(),
+                    build_diagnostics: Vec::new(),
                     failed_tests: vec!["another-unique.test".to_owned()],
                     unexpectedly_passed_tests: Vec::new(),
                     lit_summary: String::new(),
