@@ -148,6 +148,9 @@ struct Tab {
     run_table_state: TableState,
     run_triage_run_id: Option<u64>,
     run_triage: Option<WorkflowTriage>,
+    run_triage_block: usize,
+    run_triage_scroll: u16,
+    run_triage_max_scroll: u16,
 }
 
 impl Tab {
@@ -168,6 +171,9 @@ impl Tab {
             run_table_state: TableState::default(),
             run_triage_run_id: None,
             run_triage: None,
+            run_triage_block: 0,
+            run_triage_scroll: 0,
+            run_triage_max_scroll: 0,
         }
     }
 
@@ -189,6 +195,9 @@ impl Tab {
             run_table_state: TableState::default(),
             run_triage_run_id: None,
             run_triage: None,
+            run_triage_block: 0,
+            run_triage_scroll: 0,
+            run_triage_max_scroll: 0,
         }
     }
 
@@ -915,13 +924,16 @@ impl App {
                 },
             )
         } else {
+            let default_message = if self.active_tab().run_triage.is_some() {
+                "j/k: scroll triage  |  Esc: close triage  |  Ctrl-Tab: next tab  |  :q: quit"
+            } else {
+                "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit"
+            };
             (
                 " NORMAL ",
                 self.message
                     .as_deref()
-                    .unwrap_or(
-                        "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit",
-                    )
+                    .unwrap_or(default_message)
                     .to_owned(),
             )
         }
@@ -997,6 +1009,14 @@ impl App {
             KeyCode::Char('g') => {
                 self.pending_g = true;
                 return;
+            }
+            KeyCode::Esc if self.active_tab().run_triage_run_id.is_some() => {
+                let tab = self.active_tab_mut();
+                tab.run_triage_run_id = None;
+                tab.run_triage = None;
+                tab.run_triage_block = 0;
+                tab.run_triage_scroll = 0;
+                tab.run_triage_max_scroll = 0;
             }
             KeyCode::Enter => {
                 if self.active_tab().details_workflow_id.is_some() {
@@ -1651,6 +1671,9 @@ impl App {
 
         self.active_tab_mut().run_triage_run_id = Some(run_id);
         self.active_tab_mut().run_triage = None;
+        self.active_tab_mut().run_triage_block = 0;
+        self.active_tab_mut().run_triage_scroll = 0;
+        self.active_tab_mut().run_triage_max_scroll = 0;
         let source = Arc::clone(&self.workflow_source);
         let repository = self.repository.clone();
         let (sender, receiver) = mpsc::channel();
@@ -1816,6 +1839,18 @@ impl App {
 
     fn select_next(&mut self, amount: usize) {
         if self.active_tab().details_workflow_id.is_some() {
+            if self.active_tab().run_triage.is_some() {
+                let tab = self.active_tab_mut();
+                if tab.run_triage_block == 0 {
+                    tab.run_triage_block = 1;
+                } else {
+                    tab.run_triage_scroll = tab
+                        .run_triage_scroll
+                        .saturating_add(amount as u16)
+                        .min(tab.run_triage_max_scroll);
+                }
+                return;
+            }
             let count = self.active_tab().runs.len();
             if count > 0 {
                 let current = self.active_tab().run_table_state.selected().unwrap_or(0);
@@ -1838,6 +1873,15 @@ impl App {
 
     fn select_previous(&mut self, amount: usize) {
         if self.active_tab().details_workflow_id.is_some() {
+            if self.active_tab().run_triage.is_some() {
+                let tab = self.active_tab_mut();
+                if tab.run_triage_scroll > 0 {
+                    tab.run_triage_scroll = tab.run_triage_scroll.saturating_sub(amount as u16);
+                } else {
+                    tab.run_triage_block = 0;
+                }
+                return;
+            }
             let current = self.active_tab().run_table_state.selected().unwrap_or(0);
             self.active_tab_mut()
                 .run_table_state
@@ -1856,6 +1900,12 @@ impl App {
 
     fn select_first(&mut self) {
         if self.active_tab().details_workflow_id.is_some() {
+            if self.active_tab().run_triage.is_some() {
+                let tab = self.active_tab_mut();
+                tab.run_triage_block = 0;
+                tab.run_triage_scroll = 0;
+                return;
+            }
             if !self.active_tab().runs.is_empty() {
                 self.active_tab_mut().run_table_state.select(Some(0));
             }
@@ -1868,6 +1918,12 @@ impl App {
 
     fn select_last(&mut self) {
         if self.active_tab().details_workflow_id.is_some() {
+            if self.active_tab().run_triage.is_some() {
+                let tab = self.active_tab_mut();
+                tab.run_triage_block = 1;
+                tab.run_triage_scroll = tab.run_triage_max_scroll;
+                return;
+            }
             let count = self.active_tab().runs.len();
             if count > 0 {
                 self.active_tab_mut()
@@ -1965,7 +2021,7 @@ impl App {
             render_workflow_run_summary(frame, summary_area, &tab.runs);
             let (runs_area, triage_area) = if tab.run_triage_run_id.is_some() {
                 let [left, right] =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    Layout::horizontal([Constraint::Percentage(20), Constraint::Percentage(80)])
                         .areas(runs_area);
                 (left, Some(right))
             } else {
@@ -1982,24 +2038,39 @@ impl App {
             );
             if let Some(triage_area) = triage_area {
                 let run_id = tab.run_triage_run_id.unwrap();
-                let text = if self.run_triage_target
+                let loading_triage = self.run_triage_target
                     == tab
                         .details_workflow_id
                         .map(|workflow_id| (self.active_tab, workflow_id, run_id))
-                    && self.run_triage_receiver.is_some()
-                {
-                    Text::from("Triaging selected run...")
+                    && self.run_triage_receiver.is_some();
+                if loading_triage {
+                    frame.render_widget(
+                        Paragraph::new("Triaging selected run...").block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(format!(" Run {run_id} triage ")),
+                        ),
+                        triage_area,
+                    );
+                } else if let Some(triage) = tab.run_triage.as_ref() {
+                    tab.run_triage_max_scroll = render_run_triage_blocks(
+                        frame,
+                        triage_area,
+                        triage,
+                        tab.run_triage_block,
+                        tab.run_triage_scroll,
+                    );
+                    tab.run_triage_scroll = tab.run_triage_scroll.min(tab.run_triage_max_scroll);
                 } else {
-                    triage_text(tab.run_triage.as_ref())
-                };
-                frame.render_widget(
-                    Paragraph::new(text).wrap(Wrap { trim: false }).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!(" Run {run_id} triage ")),
-                    ),
-                    triage_area,
-                );
+                    frame.render_widget(
+                        Paragraph::new("(triage details unavailable)").block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(format!(" Run {run_id} triage ")),
+                        ),
+                        triage_area,
+                    );
+                }
             }
         } else {
             let pane_areas = layout_areas(&self.active_tab().layout, table_area);
@@ -2105,6 +2176,55 @@ impl App {
             y = y.saturating_add(height);
         }
     }
+}
+
+fn render_run_triage_blocks(
+    frame: &mut Frame,
+    area: Rect,
+    triage: &WorkflowTriage,
+    selected: usize,
+    log_scroll: u16,
+) -> u16 {
+    let log = if triage.failed_step_log.is_empty() {
+        Text::from("(failing step log unavailable)")
+    } else {
+        Text::from(triage.failed_step_log.as_str())
+    };
+    let blocks = [
+        (" Issue ", triage_text(Some(triage))),
+        (" Failing step log ", log),
+    ];
+    let log_max_scroll = triage_block_height(&blocks[1].1, area.width).saturating_sub(area.height);
+    let mut y = area.y;
+    for (index, (title, text)) in blocks.into_iter().enumerate().skip(selected) {
+        if y >= area.bottom() {
+            break;
+        }
+        let available_height = area.bottom() - y;
+        let height = triage_block_height(&text, area.width)
+            .min(available_height)
+            .max(1);
+        let block_area = Rect::new(area.x, y, area.width, height);
+        let border_style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let paragraph = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll(((index == 1).then_some(log_scroll).unwrap_or(0), 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(title),
+            );
+        frame.render_widget(paragraph, block_area);
+        y = y.saturating_add(height);
+    }
+    log_max_scroll
 }
 
 fn carry_workflow_runtime_fields(
@@ -3092,6 +3212,7 @@ mod tests {
                     workflow_id: workflow.id,
                     failed_jobs: format!("Job {}", workflow.id),
                     failed_steps: "Run HLSL Tests".to_owned(),
+                    failed_step_log: String::new(),
                     build_diagnostics: Vec::new(),
                     failed_tests: vec!["example.test".to_owned()],
                     unexpectedly_passed_tests: Vec::new(),
@@ -3136,6 +3257,7 @@ mod tests {
                 workflow_id: workflow.id,
                 failed_jobs: format!("Run {run_id} job"),
                 failed_steps: format!("Run {run_id} step"),
+                failed_step_log: format!("Run {run_id} full failing step log"),
                 build_diagnostics: vec![format!("run-{run_id}.cpp:1: error: failed")],
                 failed_tests: vec![format!("run-{run_id}.test")],
                 unexpectedly_passed_tests: Vec::new(),
@@ -3777,6 +3899,23 @@ mod tests {
             app.active_tab().run_triage.as_ref().unwrap().failed_steps,
             "Run 2 step"
         );
+        assert_eq!(app.active_tab().run_triage_block, 0);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_tab().run_triage_block, 1);
+        app.active_tab_mut().run_triage_max_scroll = 10;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_tab().run_triage_scroll, 1);
+        assert_eq!(
+            app.active_tab().run_table_state.selected(),
+            Some(0),
+            "scrolling triage must not change the selected run"
+        );
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.active_tab().run_triage_scroll, 0);
+        assert_eq!(app.active_tab().run_triage_block, 1);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.active_tab().run_triage_block, 0);
     }
 
     #[test]
@@ -3787,6 +3926,8 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         complete_run_triage(&mut app);
 
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.active_tab().run_triage.is_none());
         app.select_next(1);
         app.handle_key(key(KeyCode::Enter));
 
@@ -4590,6 +4731,7 @@ mod tests {
             workflow_id: 1,
             failed_jobs: "Linux tests".to_owned(),
             failed_steps: "Run HLSL Tests".to_owned(),
+            failed_step_log: String::new(),
             build_diagnostics: Vec::new(),
             failed_tests: vec!["one.test".to_owned(), "two.test".to_owned()],
             unexpectedly_passed_tests: vec!["flaky.test".to_owned()],
@@ -4631,6 +4773,7 @@ mod tests {
             workflow_id: 1,
             failed_jobs: "Build".to_owned(),
             failed_steps: "Compile".to_owned(),
+            failed_step_log: String::new(),
             build_diagnostics: vec![
                 "source.cpp:10: warning: unused variable".to_owned(),
                 "link.exe : error LNK1120: 1 unresolved externals".to_owned(),
@@ -4667,6 +4810,7 @@ mod tests {
                 workflow_id: 1,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_step_log: String::new(),
                 build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
@@ -4685,6 +4829,7 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 2,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_step_log: String::new(),
                 build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
@@ -4702,6 +4847,7 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 3,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_step_log: String::new(),
                 build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
@@ -4729,6 +4875,7 @@ Unexpectedly Passed Tests (1):
                 workflow_id: 1,
                 failed_jobs: String::new(),
                 failed_steps: String::new(),
+                failed_step_log: String::new(),
                 build_diagnostics: Vec::new(),
                 failed_tests: Vec::new(),
                 unexpectedly_passed_tests: Vec::new(),
@@ -4752,6 +4899,7 @@ Unexpectedly Passed Tests (1):
                     workflow_id: 1,
                     failed_jobs: String::new(),
                     failed_steps: String::new(),
+                    failed_step_log: String::new(),
                     build_diagnostics: Vec::new(),
                     failed_tests: vec!["shared-failure.test".to_owned()],
                     unexpectedly_passed_tests: vec!["shared-xpass.test".to_owned()],
@@ -4764,6 +4912,7 @@ Unexpectedly Passed Tests (1):
                     workflow_id: 2,
                     failed_jobs: String::new(),
                     failed_steps: String::new(),
+                    failed_step_log: String::new(),
                     build_diagnostics: Vec::new(),
                     failed_tests: vec!["shared-failure.test".to_owned(), "unique.test".to_owned()],
                     unexpectedly_passed_tests: vec!["shared-xpass.test".to_owned()],
@@ -4776,6 +4925,7 @@ Unexpectedly Passed Tests (1):
                     workflow_id: 3,
                     failed_jobs: String::new(),
                     failed_steps: String::new(),
+                    failed_step_log: String::new(),
                     build_diagnostics: Vec::new(),
                     failed_tests: vec!["another-unique.test".to_owned()],
                     unexpectedly_passed_tests: Vec::new(),

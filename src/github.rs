@@ -126,6 +126,7 @@ pub struct WorkflowTriage {
     pub workflow_id: u64,
     pub failed_jobs: String,
     pub failed_steps: String,
+    pub failed_step_log: String,
     pub build_diagnostics: Vec<String>,
     pub failed_tests: Vec<String>,
     pub unexpectedly_passed_tests: Vec<String>,
@@ -151,6 +152,7 @@ struct JobStep {
     name: String,
     conclusion: Option<String>,
     started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]
@@ -723,6 +725,7 @@ fn build_run_triage(
     let mut failed_tests = Vec::new();
     let mut unexpectedly_passed_tests = Vec::new();
     let mut build_diagnostics = Vec::new();
+    let mut failed_step_logs = Vec::new();
     let mut logs = BTreeMap::new();
     if include_build_diagnostics {
         let lit_started_at = jobs
@@ -742,6 +745,21 @@ fn build_run_triage(
                 }
             }
             logs.insert(job.id, log);
+        }
+        for failure in &failures {
+            let Some(log) = logs.get(&failure.job_id) else {
+                continue;
+            };
+            let step_log =
+                extract_step_log(log, failure.step_started_at, failure.step_completed_at);
+            if !step_log.is_empty() {
+                failed_step_logs.push(format!(
+                    "{} / {}\n{}",
+                    failure.job_name,
+                    failure.step_name.as_deref().unwrap_or("(no step info)"),
+                    step_log
+                ));
+            }
         }
     }
     for failure in failures
@@ -776,6 +794,7 @@ fn build_run_triage(
         } else {
             failed_steps
         },
+        failed_step_log: failed_step_logs.join("\n\n"),
         build_diagnostics,
         failed_tests,
         unexpectedly_passed_tests,
@@ -868,6 +887,8 @@ struct FailedJob {
     job_id: u64,
     job_name: String,
     step_name: Option<String>,
+    step_started_at: Option<DateTime<Utc>>,
+    step_completed_at: Option<DateTime<Utc>>,
 }
 
 fn failed_jobs(jobs: &[Job]) -> Vec<FailedJob> {
@@ -889,6 +910,8 @@ fn failed_jobs(jobs: &[Job]) -> Vec<FailedJob> {
             job_id: job.id,
             job_name: job.name.clone(),
             step_name: failed_step.map(|step| step.name.clone()),
+            step_started_at: failed_step.and_then(|step| step.started_at),
+            step_completed_at: failed_step.and_then(|step| step.completed_at),
         });
     }
     failures
@@ -934,6 +957,32 @@ fn fetch_job_log(repository: &Repository, job_id: u64) -> Result<String, Error> 
     let path = repository.job_logs_api_path(job_id);
     let log = successful_stdout(run_gh(&["api", &path])?)?;
     Ok(String::from_utf8_lossy(&log).into_owned())
+}
+
+fn extract_step_log(
+    log: &str,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+) -> String {
+    let Some(started_at) = started_at else {
+        return log.trim_end().to_owned();
+    };
+    let lines = log
+        .lines()
+        .filter(|line| {
+            let (timestamp, _) = split_log_timestamp(line);
+            timestamp.is_some_and(|timestamp| {
+                timestamp >= started_at
+                    && completed_at
+                        .is_none_or(|completed_at| timestamp < completed_at + Duration::seconds(1))
+            })
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        log.trim_end().to_owned()
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn extract_build_diagnostics(log: &str, lit_started_at: Option<DateTime<Utc>>) -> Vec<String> {
@@ -1331,16 +1380,19 @@ mod tests {
                         name: "Checkout".to_owned(),
                         conclusion: Some("success".to_owned()),
                         started_at: None,
+                        completed_at: None,
                     },
                     JobStep {
                         name: "Build".to_owned(),
                         conclusion: Some("failure".to_owned()),
                         started_at: None,
+                        completed_at: None,
                     },
                     JobStep {
                         name: "Test".to_owned(),
                         conclusion: Some("failure".to_owned()),
                         started_at: None,
+                        completed_at: None,
                     },
                 ],
             },
@@ -1353,11 +1405,13 @@ mod tests {
                         name: "Build".to_owned(),
                         conclusion: Some("failure".to_owned()),
                         started_at: None,
+                        completed_at: None,
                     },
                     JobStep {
                         name: "Cleanup".to_owned(),
                         conclusion: Some("cancelled".to_owned()),
                         started_at: None,
+                        completed_at: None,
                     },
                 ],
             },
@@ -2012,6 +2066,27 @@ mod tests {
             find_failed_scheduled_run_with("runs?per_page=100", |_| Ok(response.clone())).unwrap();
 
         assert_eq!(run, Some(9));
+    }
+
+    #[test]
+    fn step_log_is_bounded_by_step_timestamps() {
+        let log = "\
+2026-09-23T10:00:00Z checkout\n\
+2026-09-23T10:01:00Z compile started\n\
+2026-09-23T10:01:30Z ##[error]compile failed\n\
+2026-09-23T10:01:30.500Z linker details\n\
+2026-09-23T10:01:31Z cleanup\n";
+
+        assert_eq!(
+            extract_step_log(
+                log,
+                Some("2026-09-23T10:01:00Z".parse().unwrap()),
+                Some("2026-09-23T10:01:30Z".parse().unwrap()),
+            ),
+            "2026-09-23T10:01:00Z compile started\n\
+        2026-09-23T10:01:30Z ##[error]compile failed\n\
+        2026-09-23T10:01:30.500Z linker details"
+        );
     }
 
     #[test]
