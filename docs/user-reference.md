@@ -277,14 +277,20 @@ started display `-`.
 
 Use the normal `j`/`k`, arrow, paging, and jump bindings to navigate runs.
 Press Enter on a run to split the lower panel vertically. The run table remains
-on the left, while the right half loads and displays that run's failed jobs,
-failed steps, build diagnostics, failed tests, unexpected passes, and lit
-summary. Compiler and linker warnings and errors are collected from job logs
-only for this single-run view. Collection stops when the `Run HLSL Tests` step
-starts so diagnostics from the compiler under test are excluded. Selecting
-another run and pressing Enter replaces the right-hand triage output.
-`:refresh` reloads the run table. Workflow detail tabs cannot be split and,
-like triage tabs, are not included in saved session state.
+in the left 20%, while the right 80% displays an Issue pane followed by the
+full failing-step log. Use `j`/`k`, arrows, paging, and jump bindings to select
+and scroll these panes. When the log pane is selected, `/` starts a forward
+regular-expression search and `?` starts a backward search. Press Enter to
+run the search or Escape to cancel it. Matches are highlighted in the log;
+press `n` for the next occurrence or `N` for the previous occurrence. Searches
+wrap at the end of the log.
+
+Compiler and linker warnings and errors are collected from job logs only for
+this single-run view. Collection stops when the `Run HLSL Tests` step starts
+so diagnostics from the compiler under test are excluded. Press Escape to
+close the triage output before selecting another run. `:refresh` reloads the
+run table. Workflow detail tabs cannot be split and, like triage tabs, are not
+included in saved session state.
 
 ### Filtering and sorting
 

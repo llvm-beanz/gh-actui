@@ -25,6 +25,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
+use regex::Regex;
 
 use crate::{
     github::{
@@ -44,11 +45,18 @@ const MIN_VIEW_HEIGHT: u16 = 5;
 const MIN_VIEW_WIDTH: u16 = 20;
 const MAX_COMMAND_HISTORY: usize = 1000;
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Mode {
     #[default]
     Normal,
     Command,
+    Search(SearchDirection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchDirection {
+    Forward,
+    Backward,
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +159,9 @@ struct Tab {
     run_triage_block: usize,
     run_triage_scroll: u16,
     run_triage_max_scroll: u16,
+    run_triage_log_width: u16,
+    run_triage_search_pattern: Option<String>,
+    run_triage_search_match: Option<usize>,
 }
 
 impl Tab {
@@ -174,6 +185,9 @@ impl Tab {
             run_triage_block: 0,
             run_triage_scroll: 0,
             run_triage_max_scroll: 0,
+            run_triage_log_width: 0,
+            run_triage_search_pattern: None,
+            run_triage_search_match: None,
         }
     }
 
@@ -198,6 +212,9 @@ impl Tab {
             run_triage_block: 0,
             run_triage_scroll: 0,
             run_triage_max_scroll: 0,
+            run_triage_log_width: 0,
+            run_triage_search_pattern: None,
+            run_triage_search_match: None,
         }
     }
 
@@ -925,7 +942,7 @@ impl App {
             )
         } else {
             let default_message = if self.active_tab().run_triage.is_some() {
-                "j/k: scroll triage  |  Esc: close triage  |  Ctrl-Tab: next tab  |  :q: quit"
+                "j/k: scroll  |  /?: regex search  |  n/N: next/previous match  |  Esc: close"
             } else {
                 "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit"
             };
@@ -960,7 +977,7 @@ impl App {
 
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
-            Mode::Command => self.handle_command_key(key),
+            Mode::Command | Mode::Search(_) => self.handle_command_key(key),
         }
     }
 
@@ -1010,6 +1027,22 @@ impl App {
                 self.pending_g = true;
                 return;
             }
+            KeyCode::Char('/') if self.run_triage_log_is_active() => {
+                self.start_search(SearchDirection::Forward);
+                return;
+            }
+            KeyCode::Char('?') if self.run_triage_log_is_active() => {
+                self.start_search(SearchDirection::Backward);
+                return;
+            }
+            KeyCode::Char('n') if self.run_triage_log_is_active() => {
+                self.repeat_search(SearchDirection::Forward);
+                return;
+            }
+            KeyCode::Char('N') if self.run_triage_log_is_active() => {
+                self.repeat_search(SearchDirection::Backward);
+                return;
+            }
             KeyCode::Esc if self.active_tab().run_triage_run_id.is_some() => {
                 let tab = self.active_tab_mut();
                 tab.run_triage_run_id = None;
@@ -1017,6 +1050,9 @@ impl App {
                 tab.run_triage_block = 0;
                 tab.run_triage_scroll = 0;
                 tab.run_triage_max_scroll = 0;
+                tab.run_triage_log_width = 0;
+                tab.run_triage_search_pattern = None;
+                tab.run_triage_search_match = None;
             }
             KeyCode::Enter => {
                 if self.active_tab().details_workflow_id.is_some() {
@@ -1108,7 +1144,11 @@ impl App {
                 self.history_index = None;
                 self.history_draft.clear();
             }
-            KeyCode::Enter => self.execute_command(),
+            KeyCode::Enter => match self.mode {
+                Mode::Command => self.execute_command(),
+                Mode::Search(direction) => self.execute_search(direction),
+                Mode::Normal => {}
+            },
             KeyCode::Left => {
                 self.command_cursor = self.command_cursor.saturating_sub(1);
             }
@@ -1117,8 +1157,8 @@ impl App {
             }
             KeyCode::Home => self.command_cursor = 0,
             KeyCode::End => self.command_cursor = self.command.chars().count(),
-            KeyCode::Up => self.previous_command(),
-            KeyCode::Down => self.next_command(),
+            KeyCode::Up if self.mode == Mode::Command => self.previous_command(),
+            KeyCode::Down if self.mode == Mode::Command => self.next_command(),
             KeyCode::Backspace => self.backspace_command(),
             KeyCode::Delete => self.delete_command_character(),
             KeyCode::Char(character)
@@ -1132,6 +1172,105 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn run_triage_log_is_active(&self) -> bool {
+        self.active_tab().run_triage.is_some() && self.active_tab().run_triage_block == 1
+    }
+
+    fn start_search(&mut self, direction: SearchDirection) {
+        self.mode = Mode::Search(direction);
+        self.command.clear();
+        self.command_cursor = 0;
+        self.message = None;
+    }
+
+    fn repeat_search(&mut self, direction: SearchDirection) {
+        if self.active_tab().run_triage_search_pattern.is_none() {
+            self.message = Some("No previous search pattern".to_owned());
+            return;
+        }
+        self.command.clear();
+        self.execute_search(direction);
+    }
+
+    fn execute_search(&mut self, direction: SearchDirection) {
+        let entered_pattern = self.command.clone();
+        let pattern = if entered_pattern.is_empty() {
+            self.active_tab().run_triage_search_pattern.clone()
+        } else {
+            Some(entered_pattern)
+        };
+        let Some(pattern) = pattern else {
+            self.message = Some("No previous search pattern".to_owned());
+            self.finish_command();
+            return;
+        };
+        let regex = match Regex::new(&pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                self.message = Some(format!("Invalid regular expression: {error}"));
+                self.finish_command();
+                return;
+            }
+        };
+        let tab = self.active_tab();
+        let Some(triage) = tab.run_triage.as_ref() else {
+            self.finish_command();
+            return;
+        };
+        let width = tab.run_triage_log_width;
+        let scroll = tab.run_triage_scroll;
+        let previous_match = (tab.run_triage_search_pattern.as_deref() == Some(pattern.as_str()))
+            .then_some(tab.run_triage_search_match)
+            .flatten();
+        let matches = regex
+            .find_iter(&triage.failed_step_log)
+            .map(|matched| {
+                (
+                    matched.start(),
+                    wrapped_row_for_byte(&triage.failed_step_log, matched.start(), width),
+                )
+            })
+            .collect::<Vec<_>>();
+        let found = match direction {
+            SearchDirection::Forward => previous_match
+                .and_then(|previous| matches.iter().find(|(start, _)| *start > previous))
+                .or_else(|| {
+                    previous_match
+                        .is_none()
+                        .then(|| matches.iter().find(|(_, row)| *row >= scroll))
+                        .flatten()
+                })
+                .or_else(|| matches.first()),
+            SearchDirection::Backward => previous_match
+                .and_then(|previous| matches.iter().rev().find(|(start, _)| *start < previous))
+                .or_else(|| {
+                    previous_match
+                        .is_none()
+                        .then(|| matches.iter().rev().find(|(_, row)| *row <= scroll))
+                        .flatten()
+                })
+                .or_else(|| matches.last()),
+        };
+        let Some(&(matched_at, row)) = found else {
+            self.message = Some(format!("Pattern not found: {pattern}"));
+            self.finish_command();
+            return;
+        };
+        let tab = self.active_tab_mut();
+        tab.run_triage_block = 1;
+        tab.run_triage_scroll = row.min(tab.run_triage_max_scroll);
+        tab.run_triage_search_pattern = Some(pattern.clone());
+        tab.run_triage_search_match = Some(matched_at);
+        self.message = Some(format!(
+            "{}{pattern}",
+            match direction {
+                SearchDirection::Forward => '/',
+                SearchDirection::Backward => '?',
+            }
+        ));
+        self.finish_command();
     }
 
     fn execute_command(&mut self) {
@@ -1674,6 +1813,9 @@ impl App {
         self.active_tab_mut().run_triage_block = 0;
         self.active_tab_mut().run_triage_scroll = 0;
         self.active_tab_mut().run_triage_max_scroll = 0;
+        self.active_tab_mut().run_triage_log_width = 0;
+        self.active_tab_mut().run_triage_search_pattern = None;
+        self.active_tab_mut().run_triage_search_match = None;
         let source = Arc::clone(&self.workflow_source);
         let repository = self.repository.clone();
         let (sender, receiver) = mpsc::channel();
@@ -2053,12 +2195,15 @@ impl App {
                         triage_area,
                     );
                 } else if let Some(triage) = tab.run_triage.as_ref() {
+                    tab.run_triage_log_width = triage_area.width;
                     tab.run_triage_max_scroll = render_run_triage_blocks(
                         frame,
                         triage_area,
                         triage,
                         tab.run_triage_block,
                         tab.run_triage_scroll,
+                        tab.run_triage_search_pattern.as_deref(),
+                        tab.run_triage_search_match,
                     );
                     tab.run_triage_scroll = tab.run_triage_scroll.min(tab.run_triage_max_scroll);
                 } else {
@@ -2108,14 +2253,19 @@ impl App {
                 let (title, text) = self.normal_status();
                 render_status_bar(frame, help_area, &text, &self.refresh_rate_label(), title);
             }
-            Mode::Command => {
-                const COMMAND_PREFIX: &str = ":";
+            mode @ (Mode::Command | Mode::Search(_)) => {
+                let (prefix, title) = match mode {
+                    Mode::Command => (":", " COMMAND "),
+                    Mode::Search(SearchDirection::Forward) => ("/", " SEARCH "),
+                    Mode::Search(SearchDirection::Backward) => ("?", " SEARCH "),
+                    Mode::Normal => unreachable!(),
+                };
                 let left_area = render_status_bar(
                     frame,
                     help_area,
-                    &format!("{COMMAND_PREFIX}{}", self.command),
+                    &format!("{prefix}{}", self.command),
                     &self.refresh_rate_label(),
-                    " COMMAND ",
+                    title,
                 );
 
                 let cursor_x = if left_area.width == 0 {
@@ -2123,7 +2273,7 @@ impl App {
                 } else {
                     left_area
                         .x
-                        .saturating_add(COMMAND_PREFIX.chars().count() as u16)
+                        .saturating_add(prefix.chars().count() as u16)
                         .saturating_add(self.command_cursor as u16)
                         .min(left_area.right().saturating_sub(1))
                 };
@@ -2184,11 +2334,13 @@ fn render_run_triage_blocks(
     triage: &WorkflowTriage,
     selected: usize,
     log_scroll: u16,
+    search_pattern: Option<&str>,
+    search_match: Option<usize>,
 ) -> u16 {
     let log = if triage.failed_step_log.is_empty() {
         Text::from("(failing step log unavailable)")
     } else {
-        Text::from(triage.failed_step_log.as_str())
+        highlighted_log_text(&triage.failed_step_log, search_pattern, search_match)
     };
     let blocks = [
         (" Issue ", triage_text(Some(triage))),
@@ -2225,6 +2377,56 @@ fn render_run_triage_blocks(
         y = y.saturating_add(height);
     }
     log_max_scroll
+}
+
+fn highlighted_log_text<'a>(
+    log: &'a str,
+    search_pattern: Option<&str>,
+    search_match: Option<usize>,
+) -> Text<'a> {
+    let Some(regex) = search_pattern.and_then(|pattern| Regex::new(pattern).ok()) else {
+        return Text::from(log);
+    };
+    let matches = regex.find_iter(log).collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Text::from(log);
+    }
+
+    let mut line_start = 0;
+    let lines = log
+        .split('\n')
+        .map(|line| {
+            let line_end = line_start + line.len();
+            let mut spans = Vec::new();
+            let mut cursor = line_start;
+            for matched in matches
+                .iter()
+                .filter(|matched| matched.start() < line_end && matched.end() > line_start)
+            {
+                let match_start = matched.start().max(line_start);
+                let match_end = matched.end().min(line_end);
+                if cursor < match_start {
+                    spans.push(Span::raw(&log[cursor..match_start]));
+                }
+                let style = if search_match == Some(matched.start()) {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                };
+                spans.push(Span::styled(&log[match_start..match_end], style));
+                cursor = match_end;
+            }
+            if cursor < line_end {
+                spans.push(Span::raw(&log[cursor..line_end]));
+            }
+            line_start = line_end.saturating_add(1);
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    Text::from(lines)
 }
 
 fn carry_workflow_runtime_fields(
@@ -3000,6 +3202,19 @@ fn triage_block_height(text: &Text<'_>, width: u16) -> u16 {
         .saturating_add(2)
 }
 
+fn wrapped_row_for_byte(text: &str, byte_index: usize, width: u16) -> u16 {
+    let byte_index = byte_index.min(text.len());
+    let content_width = usize::from(width.saturating_sub(2).max(1));
+    let prefix = &text[..byte_index];
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let completed_rows = text[..line_start]
+        .split_terminator('\n')
+        .map(|line| Line::from(line).width().max(1).div_ceil(content_width))
+        .sum::<usize>();
+    let current_column = Line::from(&text[line_start..byte_index]).width();
+    u16::try_from(completed_rows.saturating_add(current_column / content_width)).unwrap_or(u16::MAX)
+}
+
 fn command_path(argument: Option<&str>, remembered: Option<&PathBuf>) -> Result<PathBuf, String> {
     match argument.filter(|argument| !argument.is_empty()) {
         Some(argument) => Ok(PathBuf::from(argument)),
@@ -3364,6 +3579,14 @@ mod tests {
         for character in command.chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
+    }
+
+    fn enter_search(app: &mut App, prefix: char, pattern: &str) {
+        app.handle_key(key(KeyCode::Char(prefix)));
+        for character in pattern.chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
     }
 
     fn complete_loading(app: &mut App) {
@@ -3937,6 +4160,78 @@ mod tests {
         assert_eq!(
             app.active_tab().run_triage.as_ref().unwrap().failed_steps,
             "Run 1 step"
+        );
+    }
+
+    #[test]
+    fn active_run_log_supports_forward_and_backward_regex_search() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_triage(&mut app);
+        app.active_tab_mut()
+            .run_triage
+            .as_mut()
+            .unwrap()
+            .failed_step_log = "header\nerror ONE\nmiddle\nerror TWO\ntail".to_owned();
+        app.active_tab_mut().run_triage_block = 1;
+        app.active_tab_mut().run_triage_log_width = 80;
+        app.active_tab_mut().run_triage_max_scroll = 4;
+
+        enter_search(&mut app, '/', r"error [A-Z]+");
+        assert_eq!(app.active_tab().run_triage_scroll, 1);
+        assert_eq!(app.active_tab().run_triage_search_match, Some(7));
+
+        enter_search(&mut app, '/', r"error [A-Z]+");
+        assert_eq!(app.active_tab().run_triage_scroll, 3);
+
+        enter_search(&mut app, '?', r"error [A-Z]+");
+        assert_eq!(app.active_tab().run_triage_scroll, 1);
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.active_tab().run_triage_scroll, 3);
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.active_tab().run_triage_scroll, 1);
+    }
+
+    #[test]
+    fn invalid_run_log_regex_preserves_scroll_position() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_triage(&mut app);
+        app.active_tab_mut().run_triage_block = 1;
+        app.active_tab_mut().run_triage_scroll = 3;
+
+        enter_search(&mut app, '/', "[");
+
+        assert_eq!(app.active_tab().run_triage_scroll, 3);
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Invalid regular expression:"))
+        );
+    }
+
+    #[test]
+    fn regex_match_position_accounts_for_wrapped_log_lines() {
+        assert_eq!(wrapped_row_for_byte("1234567890 error", 11, 7), 2);
+        assert_eq!(wrapped_row_for_byte("short\nmatch", 6, 80), 1);
+    }
+
+    #[test]
+    fn run_log_highlights_all_matches_and_distinguishes_current_match() {
+        let text = highlighted_log_text("error ONE\nerror TWO", Some(r"error [A-Z]+"), Some(10));
+
+        assert_eq!(text.lines[0].spans[0].style.bg, Some(Color::Yellow));
+        assert_eq!(text.lines[1].spans[0].style.bg, Some(Color::Cyan));
+        assert!(
+            text.lines[1].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
         );
     }
 
