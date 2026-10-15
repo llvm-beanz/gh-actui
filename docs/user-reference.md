@@ -288,11 +288,19 @@ logs.
 
 ### Pull request job details
 
-In a pull request status tab, press Enter on a highlighted job to open its
-steps in a modal. Completed successful steps have a green sphere, failed steps
-have a red sphere, skipped steps have a white sphere, and active steps have a
-yellow sphere. Use `j`/`k`, arrows, Home, and End to select a step. Escape
-closes the modal.
+In a pull request status tab, jobs with the same trailing matrix label are
+merged into one configuration row. For example, `build (ubuntu, debug)` and
+`test (ubuntu, debug)` appear as `WORKFLOW / ubuntu, debug`. Jobs without a
+shared matrix label remain separate so custom names are not grouped
+incorrectly. Custom names can place `build` or `test` before or after the
+configuration, such as `Build ubuntu debug` or `ubuntu debug / Test`. A
+configuration is failed when any of its jobs failed.
+
+Press Enter on a highlighted row to open its steps in a modal. Steps from a
+merged configuration are prefixed with their source job name. Completed
+successful steps have a green sphere, failed steps have a red sphere, skipped
+steps have a white sphere, and active steps have a yellow sphere. Use `j`/`k`,
+arrows, Home, and End to select a step. Escape closes the modal.
 
 Press Enter on a selected step to close the modal and split the tab into a 20%
 job list and an 80% full step-log view. Use `j`/`k`, paging, Home, and End to

@@ -2214,7 +2214,7 @@ impl App {
                     .and_then(|selected| modal.job.steps.get(selected))
                     .map(|step| {
                         (
-                            modal.job.id,
+                            step.job_id,
                             format!("{} / {}", modal.job.name, step.name),
                             step.clone(),
                         )
@@ -4253,13 +4253,15 @@ mod tests {
             release.name = "Pull Request Workflow / Test (release)".to_owned();
             release.run_status = RunStatus::Failure;
             release.failing_steps = Some("Test".to_owned());
-            let step = |name: &str, status: &str, conclusion: Option<&str>| WorkflowStep {
-                name: name.to_owned(),
-                status: Some(status.to_owned()),
-                conclusion: conclusion.map(str::to_owned),
-                started_at: None,
-                completed_at: None,
-            };
+            let step =
+                |job_id: u64, name: &str, status: &str, conclusion: Option<&str>| WorkflowStep {
+                    job_id,
+                    name: name.to_owned(),
+                    status: Some(status.to_owned()),
+                    conclusion: conclusion.map(str::to_owned),
+                    started_at: None,
+                    completed_at: None,
+                };
             Ok(PullRequestView {
                 workflows: vec![debug, release],
                 jobs: BTreeMap::from([
@@ -4269,10 +4271,10 @@ mod tests {
                             id: 900,
                             name: "Test (debug)".to_owned(),
                             steps: vec![
-                                step("Checkout", "completed", Some("success")),
-                                step("Tests", "completed", Some("failure")),
-                                step("Upload", "completed", Some("skipped")),
-                                step("Cleanup", "in_progress", None),
+                                step(900, "Checkout", "completed", Some("success")),
+                                step(900, "Tests", "completed", Some("failure")),
+                                step(900, "Upload", "completed", Some("skipped")),
+                                step(900, "Cleanup", "in_progress", None),
                             ],
                         },
                     ),
@@ -4281,7 +4283,7 @@ mod tests {
                         PullRequestJob {
                             id: 901,
                             name: "Test (release)".to_owned(),
-                            steps: vec![step("Tests", "completed", Some("failure"))],
+                            steps: vec![step(901, "Tests", "completed", Some("failure"))],
                         },
                     ),
                 ]),

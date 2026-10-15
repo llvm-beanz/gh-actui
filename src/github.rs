@@ -125,6 +125,7 @@ pub struct PullRequestJob {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowStep {
+    pub job_id: u64,
     pub name: String,
     pub status: Option<String>,
     pub conclusion: Option<String>,
@@ -447,13 +448,7 @@ impl WorkflowSource for GhWorkflowSource {
                     .map(|&(workflow, run)| {
                         scope.spawn(move || {
                             let jobs = fetch_jobs(repository, run.id)?;
-                            let workflows = pull_request_view_workflows(workflow, run, &jobs);
-                            let jobs: Vec<PullRequestJob> = if jobs.len() <= 1 {
-                                jobs.first().into_iter().map(pull_request_job).collect()
-                            } else {
-                                jobs.iter().map(pull_request_job).collect()
-                            };
-                            Ok((workflows, jobs))
+                            Ok(pull_request_view_entries(workflow, run, &jobs))
                         })
                     })
                     .collect::<Vec<_>>();
@@ -462,9 +457,9 @@ impl WorkflowSource for GhWorkflowSource {
                     .map(|handle| handle.join().map_err(|_| Error::StatusWorker)?)
                     .collect::<Result<Vec<_>, Error>>()
             })?;
-            for (workflows, jobs) in results {
-                for (index, workflow) in workflows.into_iter().enumerate() {
-                    if let Some(job) = jobs.get(index).cloned() {
+            for entries in results {
+                for (workflow, job) in entries {
+                    if let Some(job) = job {
                         view_jobs.insert(workflow.id, job);
                     }
                     view_workflows.push(workflow);
@@ -1171,12 +1166,24 @@ fn pull_request_triage_targets<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn pull_request_view_workflows(
     workflow: &Workflow,
     run: &LatestWorkflowRun,
     jobs: &[Job],
 ) -> Vec<Workflow> {
-    if jobs.len() <= 1 {
+    pull_request_view_entries(workflow, run, jobs)
+        .into_iter()
+        .map(|(workflow, _)| workflow)
+        .collect()
+}
+
+fn pull_request_view_entries(
+    workflow: &Workflow,
+    run: &LatestWorkflowRun,
+    jobs: &[Job],
+) -> Vec<(Workflow, Option<PullRequestJob>)> {
+    if jobs.is_empty() {
         let mut workflow = workflow.clone();
         apply_pr_status(
             &mut workflow,
@@ -1185,45 +1192,188 @@ fn pull_request_view_workflows(
             run.conclusion.as_deref(),
             failed_step_names_from_jobs(jobs),
         );
-        return vec![workflow];
+        return vec![(workflow, None)];
     }
 
-    jobs.iter()
-        .map(|job| {
+    if jobs.len() == 1 {
+        let mut workflow = workflow.clone();
+        apply_pr_status(
+            &mut workflow,
+            run.id,
+            jobs[0].status.as_deref(),
+            jobs[0].conclusion.as_deref(),
+            failed_step_names_from_jobs(jobs),
+        );
+        return vec![(workflow, Some(pull_request_job(&jobs[0])))];
+    }
+
+    pull_request_job_groups(jobs)
+        .into_iter()
+        .map(|(name, jobs)| {
             let mut configuration = workflow.clone();
-            configuration.id = matrix_configuration_id(job.id);
-            configuration.name = format!("{} / {}", workflow.name, job.name);
+            configuration.id = matrix_configuration_id(jobs[0].id);
+            configuration.name = format!("{} / {name}", workflow.name);
+            let status = if jobs
+                .iter()
+                .all(|job| job.status.as_deref() == Some("completed"))
+            {
+                "completed"
+            } else {
+                "in_progress"
+            };
+            let conclusion = if jobs.iter().any(|job| {
+                matches!(
+                    job.conclusion.as_deref(),
+                    Some("failure" | "cancelled" | "timed_out" | "startup_failure")
+                )
+            }) {
+                Some("failure")
+            } else if jobs.iter().all(|job| {
+                matches!(
+                    job.conclusion.as_deref(),
+                    Some("success" | "skipped" | "neutral")
+                )
+            }) {
+                Some("success")
+            } else {
+                None
+            };
+            let failed_steps = failed_step_names_from_job_group(&jobs);
             apply_pr_status(
                 &mut configuration,
                 run.id,
-                job.status.as_deref(),
-                job.conclusion.as_deref(),
-                failed_step_names_from_jobs(std::slice::from_ref(job)),
+                Some(status),
+                conclusion,
+                failed_steps,
             );
-            configuration
+            let job = pull_request_job_group(name, &jobs);
+            (configuration, Some(job))
+        })
+        .collect()
+}
+
+fn pull_request_job_groups(jobs: &[Job]) -> Vec<(String, Vec<&Job>)> {
+    let mut label_counts = BTreeMap::new();
+    for job in jobs {
+        if let Some(label) = matrix_job_label(&job.name) {
+            *label_counts
+                .entry(label.to_ascii_lowercase())
+                .or_insert(0usize) += 1;
+        }
+    }
+
+    let mut groups: Vec<(Option<String>, String, Vec<&Job>)> = Vec::new();
+    for job in jobs {
+        let label = matrix_job_label(&job.name);
+        let shared_key = label
+            .as_ref()
+            .map(|label| label.to_ascii_lowercase())
+            .filter(|key| label_counts.get(key).copied().unwrap_or(0) > 1);
+        if let Some((_, _, grouped_jobs)) = groups
+            .iter_mut()
+            .find(|(key, _, _)| key.as_ref() == shared_key.as_ref() && shared_key.is_some())
+        {
+            grouped_jobs.push(job);
+        } else {
+            groups.push((
+                shared_key,
+                label.unwrap_or_else(|| job.name.clone()),
+                vec![job],
+            ));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(_, name, jobs)| (name, jobs))
+        .collect()
+}
+
+fn matrix_job_label(name: &str) -> Option<String> {
+    if let Some((_, label)) = name.rsplit_once(" (")
+        && let Some(label) = label.strip_suffix(')')
+    {
+        return Some(label.to_owned());
+    }
+
+    for separator in [" / ", " - ", ": "] {
+        let parts = name.split(separator).collect::<Vec<_>>();
+        if parts.len() > 1 {
+            if is_matrix_job_phase(parts[0]) {
+                return Some(parts[1..].join(separator));
+            }
+            if is_matrix_job_phase(parts[parts.len() - 1]) {
+                return Some(parts[..parts.len() - 1].join(separator));
+            }
+        }
+    }
+
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    if words.len() > 1 {
+        if is_matrix_job_phase(words[0]) {
+            return Some(words[1..].join(" "));
+        }
+        if is_matrix_job_phase(words[words.len() - 1]) {
+            return Some(words[..words.len() - 1].join(" "));
+        }
+    } else if words.first().is_some_and(|word| is_matrix_job_phase(word)) {
+        return Some("Configuration".to_owned());
+    }
+
+    None
+}
+
+fn is_matrix_job_phase(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "build" | "test")
+}
+
+fn failed_step_names_from_job_group(jobs: &[&Job]) -> Vec<String> {
+    let grouped = jobs.len() > 1;
+    jobs.iter()
+        .flat_map(|job| {
+            job.steps
+                .iter()
+                .filter(|step| step.conclusion.as_deref() == Some("failure"))
+                .map(move |step| {
+                    if grouped {
+                        format!("{} / {}", job.name, step.name)
+                    } else {
+                        step.name.clone()
+                    }
+                })
         })
         .collect()
 }
 
 fn pull_request_job(job: &Job) -> PullRequestJob {
+    pull_request_job_group(job.name.clone(), &[job])
+}
+
+fn pull_request_job_group(name: String, jobs: &[&Job]) -> PullRequestJob {
+    let grouped = jobs.len() > 1;
     PullRequestJob {
-        id: job.id,
-        name: job.name.clone(),
-        steps: job
-            .steps
+        id: jobs[0].id,
+        name,
+        steps: jobs
             .iter()
-            .map(|step| WorkflowStep {
-                name: step.name.clone(),
-                status: if step.conclusion.is_some() {
-                    Some("completed".to_owned())
-                } else if step.started_at.is_some() {
-                    Some("in_progress".to_owned())
-                } else {
-                    Some("queued".to_owned())
-                },
-                conclusion: step.conclusion.clone(),
-                started_at: step.started_at,
-                completed_at: step.completed_at,
+            .flat_map(|job| {
+                job.steps.iter().map(move |step| WorkflowStep {
+                    job_id: job.id,
+                    name: if grouped {
+                        format!("{} / {}", job.name, step.name)
+                    } else {
+                        step.name.clone()
+                    },
+                    status: if step.conclusion.is_some() {
+                        Some("completed".to_owned())
+                    } else if step.started_at.is_some() {
+                        Some("in_progress".to_owned())
+                    } else {
+                        Some("queued".to_owned())
+                    },
+                    conclusion: step.conclusion.clone(),
+                    started_at: step.started_at,
+                    completed_at: step.completed_at,
+                })
             })
             .collect(),
     }
@@ -1731,6 +1881,89 @@ mod tests {
         );
         assert_eq!(configurations[0].run_metrics, RunMetrics::default());
         assert_eq!(configurations[1].run_metrics, RunMetrics::default());
+    }
+
+    #[test]
+    fn pull_request_view_merges_jobs_for_each_matrix_configuration() {
+        let workflow = Workflow {
+            id: 7,
+            name: "Tests".to_owned(),
+            path: ".github/workflows/tests.yml".to_owned(),
+            state: "active".to_owned(),
+            run_status: RunStatus::Other,
+            is_in_progress: false,
+            run_metrics: RunMetrics::default(),
+            last_completed_run_id: None,
+            failing_steps: None,
+        };
+        let run = LatestWorkflowRun {
+            id: 55,
+            status: Some("completed".to_owned()),
+            conclusion: Some("failure".to_owned()),
+        };
+        let job = |id, name: &str, conclusion: &str, step_name: &str| Job {
+            id,
+            name: name.to_owned(),
+            status: Some("completed".to_owned()),
+            conclusion: Some(conclusion.to_owned()),
+            steps: vec![JobStep {
+                name: step_name.to_owned(),
+                conclusion: Some(conclusion.to_owned()),
+                started_at: None,
+                completed_at: None,
+            }],
+        };
+        let jobs = vec![
+            job(101, "build (ubuntu, debug)", "success", "Compile"),
+            job(102, "build (ubuntu, release)", "success", "Compile"),
+            job(103, "test (ubuntu, debug)", "failure", "Run tests"),
+            job(104, "test (ubuntu, release)", "success", "Run tests"),
+        ];
+
+        let entries = pull_request_view_entries(&workflow, &run, &jobs);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0.name, "Tests / ubuntu, debug");
+        assert_eq!(entries[0].0.run_status, RunStatus::Failure);
+        assert_eq!(entries[1].0.name, "Tests / ubuntu, release");
+        assert_eq!(entries[1].0.run_status, RunStatus::Success);
+        let debug = entries[0].1.as_ref().unwrap();
+        assert_eq!(debug.steps.len(), 2);
+        assert_eq!(debug.steps[0].job_id, 101);
+        assert_eq!(debug.steps[0].name, "build (ubuntu, debug) / Compile");
+        assert_eq!(debug.steps[1].job_id, 103);
+        assert_eq!(debug.steps[1].name, "test (ubuntu, debug) / Run tests");
+    }
+
+    #[test]
+    fn pull_request_view_merges_custom_named_matrix_jobs() {
+        let job = |id, name: &str| Job {
+            id,
+            name: name.to_owned(),
+            status: Some("completed".to_owned()),
+            conclusion: Some("success".to_owned()),
+            steps: Vec::new(),
+        };
+        let jobs = vec![
+            job(101, "Build ubuntu debug"),
+            job(102, "Test ubuntu debug"),
+            job(103, "ubuntu release / Build"),
+            job(104, "ubuntu release / Test"),
+            job(105, "Debug configuration"),
+            job(106, "Release configuration"),
+        ];
+
+        let groups = pull_request_job_groups(&jobs);
+
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].0, "ubuntu debug");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "ubuntu release");
+        assert_eq!(groups[1].1.len(), 2);
+        assert_eq!(groups[2].0, "Debug configuration");
+        assert_eq!(groups[2].1.len(), 1);
+        assert_eq!(groups[3].0, "Release configuration");
+        assert_eq!(groups[3].1.len(), 1);
     }
 
     #[test]
