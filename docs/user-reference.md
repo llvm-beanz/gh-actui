@@ -223,6 +223,10 @@ It can start while a workflow refresh is already running; in that case it
 uses the currently displayed failing-workflow snapshot while the refresh
 continues independently.
 
+The summary and workflow panes in a triage tab scroll as one continuous view.
+Use `j`/`k` or the mouse wheel for line scrolling, `Ctrl-d`/`Ctrl-u` or
+Page Down/Page Up for larger steps, and Home/End to jump to either end.
+
 `:triage https://github.com/OWNER/REPOSITORY/pull/NUMBER` fetches the latest
 pull request run for every active workflow in the current repository and
 analyzes the failed runs. Successful, queued, and in-progress latest runs are

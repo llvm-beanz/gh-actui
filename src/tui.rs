@@ -20,10 +20,11 @@ use crossterm::{
 };
 use ratatui::{
     DefaultTerminal, Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Widget, Wrap},
 };
 use regex::Regex;
 
@@ -162,6 +163,8 @@ struct Tab {
     active_view: usize,
     is_triage: bool,
     triage_pull_request: Option<u64>,
+    triage_scroll: u16,
+    triage_max_scroll: u16,
     details_workflow_id: Option<u64>,
     runs: Vec<WorkflowRunDetail>,
     run_table_state: TableState,
@@ -189,6 +192,8 @@ impl Tab {
             active_view: 0,
             is_triage: false,
             triage_pull_request: None,
+            triage_scroll: 0,
+            triage_max_scroll: 0,
             details_workflow_id: None,
             runs: Vec::new(),
             run_table_state: TableState::default(),
@@ -217,6 +222,8 @@ impl Tab {
             layout: tab.layout,
             is_triage: false,
             triage_pull_request: None,
+            triage_scroll: 0,
+            triage_max_scroll: 0,
             details_workflow_id: None,
             runs: Vec::new(),
             run_table_state: TableState::default(),
@@ -976,7 +983,9 @@ impl App {
                 },
             )
         } else {
-            let default_message = if self.active_tab().run_triage.is_some() {
+            let default_message = if self.active_tab().is_triage {
+                "j/k: scroll  |  Ctrl-d/Ctrl-u: page  |  Home/End: first/last  |  :q: quit"
+            } else if self.active_tab().run_triage.is_some() {
                 "j/k: scroll  |  /?: regex search  |  n/N: next/previous match  |  Esc: close"
             } else {
                 "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit"
@@ -1111,8 +1120,21 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return;
+        let over_active_pane = self
+            .pane_areas
+            .iter()
+            .any(|(_, area)| area.contains((mouse.column, mouse.row).into()));
+        match mouse.kind {
+            MouseEventKind::ScrollDown if self.active_tab().is_triage && over_active_pane => {
+                self.select_next(3);
+                return;
+            }
+            MouseEventKind::ScrollUp if self.active_tab().is_triage && over_active_pane => {
+                self.select_previous(3);
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return,
         }
         if let Some(view) = self
             .pane_areas
@@ -2071,6 +2093,14 @@ impl App {
     }
 
     fn select_next(&mut self, amount: usize) {
+        if self.active_tab().is_triage {
+            let tab = self.active_tab_mut();
+            tab.triage_scroll = tab
+                .triage_scroll
+                .saturating_add(amount as u16)
+                .min(tab.triage_max_scroll);
+            return;
+        }
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
@@ -2105,6 +2135,11 @@ impl App {
     }
 
     fn select_previous(&mut self, amount: usize) {
+        if self.active_tab().is_triage {
+            let tab = self.active_tab_mut();
+            tab.triage_scroll = tab.triage_scroll.saturating_sub(amount as u16);
+            return;
+        }
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
@@ -2132,6 +2167,10 @@ impl App {
     }
 
     fn select_first(&mut self) {
+        if self.active_tab().is_triage {
+            self.active_tab_mut().triage_scroll = 0;
+            return;
+        }
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
@@ -2150,6 +2189,11 @@ impl App {
     }
 
     fn select_last(&mut self) {
+        if self.active_tab().is_triage {
+            let max_scroll = self.active_tab().triage_max_scroll;
+            self.active_tab_mut().triage_scroll = max_scroll;
+            return;
+        }
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
@@ -2234,7 +2278,12 @@ impl App {
                 );
                 frame.render_widget(empty, table_area);
             } else {
-                self.render_triage_blocks(frame, table_area, &visible_workflows);
+                let scroll = self.active_tab().triage_scroll;
+                let max_scroll =
+                    self.render_triage_blocks(frame, table_area, &visible_workflows, scroll);
+                let tab = self.active_tab_mut();
+                tab.triage_max_scroll = max_scroll;
+                tab.triage_scroll = tab.triage_scroll.min(max_scroll);
             }
         } else if self.active_tab().details_workflow_id.is_some() {
             self.pane_areas.push((0, table_area));
@@ -2373,49 +2422,58 @@ impl App {
         }
     }
 
-    fn render_triage_blocks(&self, frame: &mut Frame, area: Rect, visible_workflows: &[Workflow]) {
-        let selected = self.active_view().table_state.selected().unwrap_or(0);
-        let mut y = area.y;
+    fn render_triage_blocks(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        visible_workflows: &[Workflow],
+        scroll: u16,
+    ) -> u16 {
         let summary = triage_correlation_summary(visible_workflows, &self.triage);
-        let summary_height = triage_block_height(&summary, area.width)
-            .min(area.height)
-            .max(1);
-        let summary_area = Rect::new(area.x, y, area.width, summary_height);
+        let summary_height = triage_block_height(&summary, area.width).max(1);
+        let workflow_blocks = visible_workflows
+            .iter()
+            .map(|workflow| {
+                let text = triage_text(self.triage.get(&workflow.id));
+                let height = triage_block_height(&text, area.width).max(1);
+                (workflow, text, height)
+            })
+            .collect::<Vec<_>>();
+        let total_height = workflow_blocks
+            .iter()
+            .fold(summary_height, |height, (_, _, block_height)| {
+                height.saturating_add(*block_height)
+            });
+        let buffer_height = total_height.max(area.height);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, area.width, buffer_height));
+        let summary_area = Rect::new(0, 0, area.width, summary_height);
         let summary_panel = Paragraph::new(summary).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Tests across multiple workflows "),
         );
-        frame.render_widget(summary_panel, summary_area);
-        y = y.saturating_add(summary_height);
+        summary_panel.render(summary_area, &mut buffer);
 
-        for (index, workflow) in visible_workflows.iter().enumerate().skip(selected) {
-            if y >= area.bottom() {
-                break;
-            }
-            let triage = self.triage.get(&workflow.id);
-            let text = triage_text(triage);
-            let available_height = area.bottom() - y;
-            let height = triage_block_height(&text, area.width)
-                .min(available_height)
-                .max(1);
-            let block_area = Rect::new(area.x, y, area.width, height);
-            let selected_style = if index == selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+        let mut y = summary_height;
+        for (workflow, text, height) in workflow_blocks {
+            let block_area = Rect::new(0, y, area.width, height);
             let panel = Paragraph::new(text).wrap(Wrap { trim: false }).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(selected_style)
                     .title(format!(" {} ", workflow.name)),
             );
-            frame.render_widget(panel, block_area);
+            panel.render(block_area, &mut buffer);
             y = y.saturating_add(height);
         }
+
+        let scroll = scroll.min(total_height.saturating_sub(area.height));
+        for row in 0..area.height {
+            for column in 0..area.width {
+                let source = buffer[(column, row.saturating_add(scroll))].clone();
+                frame.buffer_mut()[(area.x + column, area.y + row)] = source;
+            }
+        }
+        total_height.saturating_sub(area.height)
     }
 }
 
@@ -4180,6 +4238,50 @@ mod tests {
         assert_eq!(tabs[0].workflow_ids, vec![0, 1, 2]);
         assert_eq!(tabs[0].selected_workflow_id, Some(0));
         assert_eq!(active_tab, 0);
+    }
+
+    #[test]
+    fn triage_navigation_scrolls_one_continuous_view_without_changing_selection() {
+        let mut app = app(3);
+        app.active_tab_mut().is_triage = true;
+        app.active_tab_mut().triage_max_scroll = 20;
+        let selected = app.active_view().table_state.selected();
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_tab().triage_scroll, 1);
+        assert_eq!(app.active_view().table_state.selected(), selected);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.active_tab().triage_scroll, 11);
+
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.active_tab().triage_scroll, 20);
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.active_tab().triage_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_shared_triage_view() {
+        let mut app = app(2);
+        app.active_tab_mut().is_triage = true;
+        app.active_tab_mut().triage_max_scroll = 20;
+        app.pane_areas = vec![(0, Rect::new(0, 0, 80, 24))];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.active_tab().triage_scroll, 3);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.active_tab().triage_scroll, 0);
     }
 
     #[test]
