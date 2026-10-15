@@ -3592,21 +3592,36 @@ mod tests {
             _repository: &Repository,
             pull_request_number: u64,
         ) -> Result<PullRequestTriage, crate::github::Error> {
-            let mut pull_request_workflow = workflow(200);
-            pull_request_workflow.name = "Pull Request Workflow".to_owned();
-            pull_request_workflow.run_status = RunStatus::Failure;
+            let mut debug = workflow(200);
+            debug.name = "Pull Request Workflow / Test (debug)".to_owned();
+            debug.run_status = RunStatus::Failure;
+            let mut release = workflow(201);
+            release.name = "Pull Request Workflow / Test (release)".to_owned();
+            release.run_status = RunStatus::Failure;
             Ok(PullRequestTriage {
-                workflows: vec![pull_request_workflow],
-                failures: vec![WorkflowTriage {
-                    workflow_id: 200,
-                    failed_jobs: format!("PR {pull_request_number} job 200"),
-                    failed_steps: "Test".to_owned(),
-                    failed_step_log: String::new(),
-                    build_diagnostics: Vec::new(),
-                    failed_tests: Vec::new(),
-                    unexpectedly_passed_tests: Vec::new(),
-                    lit_summary: String::new(),
-                }],
+                workflows: vec![debug, release],
+                failures: vec![
+                    WorkflowTriage {
+                        workflow_id: 200,
+                        failed_jobs: format!("PR {pull_request_number} debug"),
+                        failed_steps: "Test".to_owned(),
+                        failed_step_log: String::new(),
+                        build_diagnostics: Vec::new(),
+                        failed_tests: vec!["shared.test".to_owned(), "debug.test".to_owned()],
+                        unexpectedly_passed_tests: Vec::new(),
+                        lit_summary: "debug summary".to_owned(),
+                    },
+                    WorkflowTriage {
+                        workflow_id: 201,
+                        failed_jobs: format!("PR {pull_request_number} release"),
+                        failed_steps: "Test".to_owned(),
+                        failed_step_log: String::new(),
+                        build_diagnostics: Vec::new(),
+                        failed_tests: vec!["shared.test".to_owned(), "release.test".to_owned()],
+                        unexpectedly_passed_tests: Vec::new(),
+                        lit_summary: "release summary".to_owned(),
+                    },
+                ],
             })
         }
 
@@ -5185,14 +5200,25 @@ mod tests {
 
         assert!(app.triage_receiver.is_some());
         complete_triage(&mut app);
-        assert_eq!(app.active_tab().workflow_ids, vec![200]);
-        assert_eq!(app.visible_workflows()[0].name, "Pull Request Workflow");
-        assert_eq!(app.triage[&200].failed_jobs, "PR 42 job 200");
+        assert_eq!(app.active_tab().workflow_ids, vec![200, 201]);
+        let visible = app
+            .visible_workflows()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(visible[0].name, "Pull Request Workflow / Test (debug)");
+        assert_eq!(visible[1].name, "Pull Request Workflow / Test (release)");
+        assert_eq!(app.triage[&200].lit_summary, "debug summary");
+        assert_eq!(app.triage[&201].lit_summary, "release summary");
+        let correlation = triage_correlation_summary(&visible, &app.triage).to_string();
+        assert!(correlation.contains("shared.test"));
+        assert!(correlation.contains("Test (debug)"));
+        assert!(correlation.contains("Test (release)"));
 
         enter_command(&mut app, "refresh");
         app.handle_key(key(KeyCode::Enter));
         complete_triage(&mut app);
-        assert_eq!(app.triage[&200].failed_jobs, "PR 42 job 200");
+        assert_eq!(app.active_tab().workflow_ids, vec![200, 201]);
     }
 
     #[test]
@@ -5229,9 +5255,11 @@ mod tests {
 
         assert!(app.triage_receiver.is_some());
         complete_triage(&mut app);
-        assert_eq!(app.active_tab().workflow_ids, vec![200]);
-        assert_eq!(app.visible_workflows()[0].name, "Pull Request Workflow");
-        assert_eq!(app.triage[&200].failed_jobs, "PR 42 job 200");
+        assert_eq!(app.active_tab().workflow_ids, vec![200, 201]);
+        assert_eq!(
+            app.visible_workflows()[0].name,
+            "Pull Request Workflow / Test (debug)"
+        );
     }
 
     #[test]

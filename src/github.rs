@@ -352,23 +352,26 @@ impl WorkflowSource for GhWorkflowSource {
             successful_stdout(run_gh(&["api", "-X", "GET", path])?)
         })?;
 
-        let mut workflows = self.list_workflows(repository)?;
-        workflows.retain(|workflow| latest_failed_runs.contains_key(&workflow.id));
-        for workflow in &mut workflows {
-            workflow.run_status = RunStatus::Failure;
-            workflow.last_completed_run_id = latest_failed_runs.get(&workflow.id).copied();
-        }
+        let workflows = self.list_workflows(repository)?;
         let targets = workflows
             .iter()
-            .map(|workflow| (workflow.id, latest_failed_runs[&workflow.id]))
+            .filter_map(|workflow| {
+                latest_failed_runs
+                    .get(&workflow.id)
+                    .copied()
+                    .map(|run_id| (workflow, run_id))
+            })
             .collect::<Vec<_>>();
-        let mut triage = Vec::new();
+        let mut configurations = Vec::new();
+        let mut failures = Vec::new();
         for chunk in targets.chunks(MAX_CONCURRENT_REQUESTS) {
             let results = thread::scope(|scope| {
                 let handles = chunk
                     .iter()
-                    .map(|&(workflow_id, run_id)| {
-                        scope.spawn(move || build_run_triage(repository, workflow_id, run_id, true))
+                    .map(|&(workflow, run_id)| {
+                        scope.spawn(move || {
+                            build_pull_request_configurations(repository, workflow, run_id)
+                        })
                     })
                     .collect::<Vec<_>>();
                 handles
@@ -376,11 +379,14 @@ impl WorkflowSource for GhWorkflowSource {
                     .map(|handle| handle.join().map_err(|_| Error::StatusWorker)?)
                     .collect::<Result<Vec<_>, Error>>()
             })?;
-            triage.extend(results);
+            for result in results {
+                configurations.extend(result.workflows);
+                failures.extend(result.failures);
+            }
         }
         Ok(PullRequestTriage {
-            workflows,
-            failures: triage,
+            workflows: configurations,
+            failures,
         })
     }
 
@@ -781,7 +787,16 @@ fn build_run_triage(
     include_build_diagnostics: bool,
 ) -> Result<WorkflowTriage, Error> {
     let jobs = fetch_jobs(repository, run_id)?;
-    let failures = failed_jobs(&jobs);
+    build_jobs_triage(repository, workflow_id, &jobs, include_build_diagnostics)
+}
+
+fn build_jobs_triage(
+    repository: &Repository,
+    workflow_id: u64,
+    jobs: &[Job],
+    include_build_diagnostics: bool,
+) -> Result<WorkflowTriage, Error> {
+    let failures = failed_jobs(jobs);
     let failed_jobs = failures
         .iter()
         .map(|failure| failure.job_name.as_str())
@@ -871,6 +886,61 @@ fn build_run_triage(
         unexpectedly_passed_tests,
         lit_summary: summaries.join("\n\n"),
     })
+}
+
+fn build_pull_request_configurations(
+    repository: &Repository,
+    workflow: &Workflow,
+    run_id: u64,
+) -> Result<PullRequestTriage, Error> {
+    let jobs = fetch_jobs(repository, run_id)?;
+    let mut workflows = Vec::new();
+    let mut failures = Vec::new();
+    for job in jobs.iter().filter(|job| is_failed_job(job)) {
+        let configuration_id = matrix_configuration_id(job.id);
+        let triage = build_jobs_triage(
+            repository,
+            configuration_id,
+            std::slice::from_ref(job),
+            true,
+        )?;
+        let configuration =
+            matrix_configuration_workflow(workflow, job, run_id, triage.failed_steps.clone());
+        workflows.push(configuration);
+        failures.push(triage);
+    }
+    if workflows.is_empty() {
+        let triage = build_jobs_triage(repository, workflow.id, &jobs, true)?;
+        let mut workflow = workflow.clone();
+        workflow.run_status = RunStatus::Failure;
+        workflow.last_completed_run_id = Some(run_id);
+        workflow.failing_steps = Some(triage.failed_steps.clone());
+        workflows.push(workflow);
+        failures.push(triage);
+    }
+    Ok(PullRequestTriage {
+        workflows,
+        failures,
+    })
+}
+
+fn matrix_configuration_id(job_id: u64) -> u64 {
+    job_id | (1 << 63)
+}
+
+fn matrix_configuration_workflow(
+    workflow: &Workflow,
+    job: &Job,
+    run_id: u64,
+    failed_steps: String,
+) -> Workflow {
+    let mut configuration = workflow.clone();
+    configuration.id = matrix_configuration_id(job.id);
+    configuration.name = format!("{} / {}", workflow.name, job.name);
+    configuration.run_status = RunStatus::Failure;
+    configuration.last_completed_run_id = Some(run_id);
+    configuration.failing_steps = Some(failed_steps);
+    configuration
 }
 
 fn workflow_has_schedule_trigger(
@@ -997,10 +1067,7 @@ struct FailedJob {
 fn failed_jobs(jobs: &[Job]) -> Vec<FailedJob> {
     let mut failures = Vec::new();
     for job in jobs {
-        if matches!(
-            job.conclusion.as_deref(),
-            None | Some("success" | "skipped" | "neutral")
-        ) {
+        if !is_failed_job(job) {
             continue;
         }
         let failed_step = job.steps.iter().find(|step| {
@@ -1018,6 +1085,13 @@ fn failed_jobs(jobs: &[Job]) -> Vec<FailedJob> {
         });
     }
     failures
+}
+
+fn is_failed_job(job: &Job) -> bool {
+    !matches!(
+        job.conclusion.as_deref(),
+        None | Some("success" | "skipped" | "neutral")
+    )
 }
 
 fn fetch_failed_step_names(repository: &Repository, run_id: u64) -> Result<Vec<String>, Error> {
@@ -1326,6 +1400,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(runs, BTreeMap::from([(3, 30)]));
+    }
+
+    #[test]
+    fn matrix_jobs_become_distinct_named_workflows() {
+        let workflow = Workflow {
+            id: 7,
+            name: "Tests".to_owned(),
+            path: ".github/workflows/tests.yml".to_owned(),
+            state: "active".to_owned(),
+            run_status: RunStatus::Other,
+            is_in_progress: false,
+            run_metrics: RunMetrics::default(),
+            last_completed_run_id: None,
+            failing_steps: None,
+        };
+        let debug = Job {
+            id: 101,
+            name: "Test (ubuntu, debug)".to_owned(),
+            conclusion: Some("failure".to_owned()),
+            steps: Vec::new(),
+        };
+        let release = Job {
+            id: 102,
+            name: "Test (ubuntu, release)".to_owned(),
+            conclusion: Some("failure".to_owned()),
+            steps: Vec::new(),
+        };
+
+        let debug = matrix_configuration_workflow(&workflow, &debug, 55, "Build".to_owned());
+        let release = matrix_configuration_workflow(&workflow, &release, 55, "Test".to_owned());
+
+        assert_ne!(debug.id, release.id);
+        assert_eq!(debug.name, "Tests / Test (ubuntu, debug)");
+        assert_eq!(release.name, "Tests / Test (ubuntu, release)");
+        assert_eq!(debug.last_completed_run_id, Some(55));
+        assert_eq!(debug.failing_steps.as_deref(), Some("Build"));
     }
 
     #[test]

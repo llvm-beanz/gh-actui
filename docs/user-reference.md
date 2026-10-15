@@ -235,6 +235,12 @@ not replaced by older failures. Passing the same pull request URL directly to
 downloads failed job logs and includes the same diagnostics, failed tests, and
 step-log details shown when triaging an individual run.
 
+For matrix workflows, each failed expanded job is displayed as a separate
+configuration named `WORKFLOW / JOB (MATRIX VALUES)`. Diagnostics, failed tests,
+and lit summaries are calculated independently for each configuration. The
+cross-workflow summary treats these configurations as distinct workflows, so a
+test failing in multiple matrix configurations is correlated across them.
+
 For each candidate, `gh-actui` first fetches its workflow YAML and excludes
 workflows without a top-level `on.schedule` trigger. This prevents
 non-scheduled workflows with large histories from forcing a scan of their
