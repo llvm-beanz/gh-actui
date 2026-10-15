@@ -12,6 +12,7 @@ Rust with an interactive terminal UI powered by [Ratatui](https://ratatui.rs/).
 
 ```console
 cargo run -- https://github.com/llvm/offload-test-suite
+cargo run -- https://github.com/llvm/offload-test-suite/pull/123
 ```
 
 The table displays the repository's active GitHub Actions workflows with

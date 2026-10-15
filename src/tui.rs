@@ -29,11 +29,11 @@ use regex::Regex;
 
 use crate::{
     github::{
-        MAX_CONCURRENT_REQUESTS, RunCounts, RunStatus, Workflow, WorkflowRunDetail, WorkflowSource,
-        WorkflowTriage,
+        MAX_CONCURRENT_REQUESTS, PullRequestTriage, RunCounts, RunStatus, Workflow,
+        WorkflowRunDetail, WorkflowSource, WorkflowTriage,
     },
     query::{FilterExpression, SortSpec, select_workflows},
-    repository::Repository,
+    repository::{PullRequest, Repository},
     state::{EQUAL_SPLIT_RATIO, SplitDirection, ViewLayout, ViewPane, ViewState, ViewTab},
 };
 
@@ -109,8 +109,18 @@ enum LoadKind {
 
 #[derive(Clone, Copy)]
 enum TriageTarget {
-    NewTab { insert_after: usize },
-    RefreshTab { index: usize },
+    NewTab {
+        insert_after: usize,
+        pull_request_number: Option<u64>,
+    },
+    RefreshTab {
+        index: usize,
+    },
+}
+
+enum TriageResponse {
+    Workflows(Vec<WorkflowTriage>),
+    PullRequest(PullRequestTriage),
 }
 
 #[derive(Clone)]
@@ -151,6 +161,7 @@ struct Tab {
     layout: ViewLayout,
     active_view: usize,
     is_triage: bool,
+    triage_pull_request: Option<u64>,
     details_workflow_id: Option<u64>,
     runs: Vec<WorkflowRunDetail>,
     run_table_state: TableState,
@@ -177,6 +188,7 @@ impl Tab {
             layout: ViewLayout::default(),
             active_view: 0,
             is_triage: false,
+            triage_pull_request: None,
             details_workflow_id: None,
             runs: Vec::new(),
             run_table_state: TableState::default(),
@@ -204,6 +216,7 @@ impl Tab {
             views,
             layout: tab.layout,
             is_triage: false,
+            triage_pull_request: None,
             details_workflow_id: None,
             runs: Vec::new(),
             run_table_state: TableState::default(),
@@ -255,7 +268,7 @@ struct App {
     load_failures: Vec<String>,
     loaded_status_count: usize,
     loading_status_ids: BTreeSet<u64>,
-    triage_receiver: Option<Receiver<Result<Vec<WorkflowTriage>, crate::github::Error>>>,
+    triage_receiver: Option<Receiver<Result<TriageResponse, crate::github::Error>>>,
     triage_target: Option<TriageTarget>,
     triage: HashMap<u64, WorkflowTriage>,
     run_details_receiver: Option<Receiver<Result<Vec<WorkflowRunDetail>, crate::github::Error>>>,
@@ -279,6 +292,7 @@ struct App {
     next_refresh: Instant,
     pending_ctrl_w: bool,
     pane_areas: Vec<(usize, Rect)>,
+    pending_pull_request: Option<u64>,
 }
 
 impl App {
@@ -341,6 +355,7 @@ impl App {
             next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
             pending_ctrl_w: false,
             pane_areas: Vec::new(),
+            pending_pull_request: None,
         };
         app.repair_all_tab_selections(None);
         app
@@ -598,11 +613,26 @@ impl App {
 
     fn finish_triage(
         &mut self,
-        result: Result<Vec<WorkflowTriage>, String>,
+        result: Result<TriageResponse, String>,
         target: Option<TriageTarget>,
     ) {
         match result {
-            Ok(results) => {
+            Ok(response) => {
+                let results = match response {
+                    TriageResponse::Workflows(results) => results,
+                    TriageResponse::PullRequest(result) => {
+                        for workflow in result.workflows {
+                            if !self
+                                .workflows
+                                .iter()
+                                .any(|existing| existing.id == workflow.id)
+                            {
+                                self.workflows.push(workflow);
+                            }
+                        }
+                        result.failures
+                    }
+                };
                 let workflow_ids = results
                     .iter()
                     .map(|result| result.workflow_id)
@@ -643,9 +673,13 @@ impl App {
                             .table_state
                             .select(selected);
                     }
-                    Some(TriageTarget::NewTab { insert_after }) => {
+                    Some(TriageTarget::NewTab {
+                        insert_after,
+                        pull_request_number,
+                    }) => {
                         let mut tab = Tab::new(Some("Triage".to_owned()), workflow_ids, None, None);
                         tab.is_triage = true;
+                        tab.triage_pull_request = pull_request_number;
                         let has_workflows = !tab.active_view().workflow_ids.is_empty();
                         tab.active_view_mut()
                             .table_state
@@ -660,10 +694,7 @@ impl App {
                         return;
                     }
                 }
-                self.message = Some(format!(
-                    "{} failing scheduled workflows triaged",
-                    result_count
-                ));
+                self.message = Some(format!("{} failing workflows triaged", result_count));
             }
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
@@ -748,6 +779,7 @@ impl App {
             return;
         };
 
+        let start_pull_request = result.is_ok() && pending.kind == LoadKind::Initial;
         match result {
             Ok(()) => {
                 let completed = match pending.kind {
@@ -768,6 +800,9 @@ impl App {
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
         self.next_refresh = Instant::now() + self.refresh_interval;
+        if start_pull_request && let Some(number) = self.pending_pull_request.take() {
+            self.start_pull_request_triage(number);
+        }
     }
 
     fn is_loading(&self) -> bool {
@@ -1316,7 +1351,10 @@ impl App {
             "resize" => self.resize_command(argument),
             "tabnew" => self.tab_new(argument),
             "tabsetname" => self.tab_set_name(argument),
-            "triage" if argument.is_none() => self.start_triage(),
+            "triage" => match argument {
+                Some(url) => self.start_pull_request_triage_url(url),
+                None => self.start_triage(),
+            },
             "tabnext" | "tabn" if argument.is_none() => self.tab_next(),
             "tabprevious" | "tabp" if argument.is_none() => self.tab_previous(),
             "tabclose" | "tabc" if argument.is_none() => self.tab_close(),
@@ -1846,11 +1884,55 @@ impl App {
         let repository = self.repository.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send(source.triage_workflows(&repository, &workflows));
+            let result = source
+                .triage_workflows(&repository, &workflows)
+                .map(TriageResponse::Workflows);
+            let _ = sender.send(result);
         });
         self.triage_receiver = Some(receiver);
         self.triage_target = Some(TriageTarget::NewTab {
             insert_after: self.active_tab,
+            pull_request_number: None,
+        });
+        self.message = None;
+    }
+
+    fn start_pull_request_triage_url(&mut self, url: &str) {
+        let pull_request = match url.parse::<PullRequest>() {
+            Ok(pull_request) => pull_request,
+            Err(error) => {
+                self.message = Some(format!("E474: Invalid pull request URL: {error}"));
+                return;
+            }
+        };
+        if pull_request.repository != self.repository {
+            self.message = Some(format!(
+                "E474: Pull request belongs to {}, not {}",
+                pull_request.repository, self.repository
+            ));
+            return;
+        }
+        self.start_pull_request_triage(pull_request.number);
+    }
+
+    fn start_pull_request_triage(&mut self, pull_request_number: u64) {
+        if self.triage_receiver.is_some() {
+            self.message = Some("Triage already in progress".to_owned());
+            return;
+        }
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = source
+                .triage_pull_request(&repository, pull_request_number)
+                .map(TriageResponse::PullRequest);
+            let _ = sender.send(result);
+        });
+        self.triage_receiver = Some(receiver);
+        self.triage_target = Some(TriageTarget::NewTab {
+            insert_after: self.active_tab,
+            pull_request_number: Some(pull_request_number),
         });
         self.message = None;
     }
@@ -1872,9 +1954,18 @@ impl App {
         let source = Arc::clone(&self.workflow_source);
         let repository = self.repository.clone();
         let target = self.active_tab;
+        let pull_request_number = self.active_tab().triage_pull_request;
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send(source.triage_workflows(&repository, &workflows));
+            let result = match pull_request_number {
+                Some(number) => source
+                    .triage_pull_request(&repository, number)
+                    .map(TriageResponse::PullRequest),
+                None => source
+                    .triage_workflows(&repository, &workflows)
+                    .map(TriageResponse::Workflows),
+            };
+            let _ = sender.send(result);
         });
         self.triage_receiver = Some(receiver);
         self.triage_target = Some(TriageTarget::RefreshTab { index: target });
@@ -3350,6 +3441,7 @@ pub fn run(
     active_tab: usize,
     state_path: Option<PathBuf>,
     workflow_source: Arc<dyn WorkflowSource>,
+    pull_request_number: Option<u64>,
 ) -> io::Result<()> {
     install_panic_hook();
     let mut terminal = ratatui::init();
@@ -3365,6 +3457,7 @@ pub fn run(
         tabs,
         active_tab,
     );
+    app.pending_pull_request = pull_request_number;
     if let Some(path) = command_history_path() {
         match load_command_history(&path) {
             Ok(history) => app.command_history = history,
@@ -3434,6 +3527,29 @@ mod tests {
                     lit_summary: "Failed Tests (1): example.test".to_owned(),
                 })
                 .collect())
+        }
+
+        fn triage_pull_request(
+            &self,
+            _repository: &Repository,
+            pull_request_number: u64,
+        ) -> Result<PullRequestTriage, crate::github::Error> {
+            let mut pull_request_workflow = workflow(200);
+            pull_request_workflow.name = "Pull Request Workflow".to_owned();
+            pull_request_workflow.run_status = RunStatus::Failure;
+            Ok(PullRequestTriage {
+                workflows: vec![pull_request_workflow],
+                failures: vec![WorkflowTriage {
+                    workflow_id: 200,
+                    failed_jobs: format!("PR {pull_request_number} job 200"),
+                    failed_steps: "Test".to_owned(),
+                    failed_step_log: String::new(),
+                    build_diagnostics: Vec::new(),
+                    failed_tests: Vec::new(),
+                    unexpectedly_passed_tests: Vec::new(),
+                    lit_summary: String::new(),
+                }],
+            })
         }
 
         fn list_workflow_runs(
@@ -4952,10 +5068,68 @@ mod tests {
         assert!(app.active_tab().is_triage);
         assert_eq!(app.active_tab().workflow_ids, vec![0, 2]);
         assert_eq!(app.triage[&0].failed_jobs, "Job 0");
+        assert_eq!(app.message.as_deref(), Some("2 failing workflows triaged"));
+    }
+
+    #[test]
+    fn triage_command_accepts_pull_request_url() {
+        let mut app = app(2);
+
+        enter_command(
+            &mut app,
+            "triage https://github.com/owner/repository/pull/42",
+        );
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.triage_receiver.is_some());
+        complete_triage(&mut app);
+        assert_eq!(app.active_tab().workflow_ids, vec![200]);
+        assert_eq!(app.visible_workflows()[0].name, "Pull Request Workflow");
+        assert_eq!(app.triage[&200].failed_jobs, "PR 42 job 200");
+
+        enter_command(&mut app, "refresh");
+        app.handle_key(key(KeyCode::Enter));
+        complete_triage(&mut app);
+        assert_eq!(app.triage[&200].failed_jobs, "PR 42 job 200");
+    }
+
+    #[test]
+    fn triage_command_rejects_pull_request_from_another_repository() {
+        let mut app = app(1);
+
+        enter_command(
+            &mut app,
+            "triage https://github.com/other/repository/pull/42",
+        );
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.triage_receiver.is_none());
         assert_eq!(
             app.message.as_deref(),
-            Some("2 failing scheduled workflows triaged")
+            Some("E474: Pull request belongs to other/repository, not owner/repository")
         );
+    }
+
+    #[test]
+    fn startup_pull_request_triage_starts_after_initial_load() {
+        let repository = "owner/repository".parse().unwrap();
+        let mut app = App::new_loading(
+            repository,
+            None,
+            None,
+            Arc::new(TestWorkflowSource),
+            None,
+            0,
+        );
+        app.pending_pull_request = Some(42);
+
+        complete_loading(&mut app);
+
+        assert!(app.triage_receiver.is_some());
+        complete_triage(&mut app);
+        assert_eq!(app.active_tab().workflow_ids, vec![200]);
+        assert_eq!(app.visible_workflows()[0].name, "Pull Request Workflow");
+        assert_eq!(app.triage[&200].failed_jobs, "PR 42 job 200");
     }
 
     #[test]

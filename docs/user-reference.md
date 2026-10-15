@@ -4,10 +4,13 @@
 
 ```console
 gh actui <REPOSITORY_OR_STATE_FILE>
+gh actui <PULL_REQUEST_URL>
 ```
 
 The argument can be an HTTPS GitHub URL, an `OWNER/REPO` name, or the path to
-an existing JSON view state file.
+an existing JSON view state file. A pull request URL opens its repository and
+automatically triages the latest run of every workflow attached to that pull
+request.
 
 The main table lists the names and run status of active workflows. Workflows in
 any disabled or deleted state are omitted. The highlighted row is the current
@@ -166,7 +169,8 @@ startup and updated after every executed command, including `:q`.
 | `:tabnext` or `:tabn` | Switch to the next tab |
 | `:tabprevious` or `:tabp` | Switch to the previous tab |
 | `:tabclose` or `:tabc` | Close the active tab |
-| `:triage` | Analyze visible failing workflows and open an enriched triage tab |
+| `:triage` | Analyze visible failing scheduled workflows and open an enriched triage tab |
+| `:triage PULL_REQUEST_URL` | Analyze the latest failed workflow runs attached to a pull request |
 | `:d` | Delete the selected workflow from the view |
 | `:dN` | Delete `N` consecutive workflows starting at the selection |
 
@@ -218,6 +222,15 @@ latest completed run status is failing. It does not change the source tab.
 It can start while a workflow refresh is already running; in that case it
 uses the currently displayed failing-workflow snapshot while the refresh
 continues independently.
+
+`:triage https://github.com/OWNER/REPOSITORY/pull/NUMBER` fetches the latest
+pull request run for every active workflow in the current repository and
+analyzes the failed runs. Successful, queued, and in-progress latest runs are
+not replaced by older failures. Passing the same pull request URL directly to
+`gh actui` starts this analysis after the repository loads. Pull request triage
+downloads failed job logs and includes the same diagnostics, failed tests, and
+step-log details shown when triaging an individual run.
+
 For each candidate, `gh-actui` first fetches its workflow YAML and excludes
 workflows without a top-level `on.schedule` trigger. This prevents
 non-scheduled workflows with large histories from forcing a scan of their

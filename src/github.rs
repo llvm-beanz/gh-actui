@@ -103,6 +103,7 @@ impl WorkflowRunDetail {
 #[derive(Debug, Deserialize)]
 struct WorkflowRun {
     id: Option<u64>,
+    workflow_id: Option<u64>,
     status: Option<String>,
     conclusion: Option<String>,
     event: Option<String>,
@@ -133,9 +134,25 @@ pub struct WorkflowTriage {
     pub lit_summary: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullRequestTriage {
+    pub workflows: Vec<Workflow>,
+    pub failures: Vec<WorkflowTriage>,
+}
+
 #[derive(Debug, Deserialize)]
 struct JobsPage {
     jobs: Vec<Job>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestResponse {
+    head: PullRequestHead,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHead {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +209,13 @@ pub trait WorkflowSource: Send + Sync {
         repository: &Repository,
         workflows: &[Workflow],
     ) -> Result<Vec<WorkflowTriage>, Error>;
+    fn triage_pull_request(
+        &self,
+        _repository: &Repository,
+        _pull_request_number: u64,
+    ) -> Result<PullRequestTriage, Error> {
+        Err(Error::RunTriageUnavailable)
+    }
     fn triage_run(
         &self,
         _repository: &Repository,
@@ -200,6 +224,7 @@ pub trait WorkflowSource: Send + Sync {
     ) -> Result<WorkflowTriage, Error> {
         Err(Error::RunTriageUnavailable)
     }
+
     /// Persist any cached data gathered during a load.
     fn flush(&self) {}
 }
@@ -311,6 +336,52 @@ impl WorkflowSource for GhWorkflowSource {
             triage.extend(results.into_iter().flatten());
         }
         Ok(triage)
+    }
+
+    fn triage_pull_request(
+        &self,
+        repository: &Repository,
+        pull_request_number: u64,
+    ) -> Result<PullRequestTriage, Error> {
+        let pull_path = repository.pull_request_api_path(pull_request_number);
+        let pull: PullRequestResponse = serde_json::from_slice(&successful_stdout(run_gh(&[
+            "api", "-X", "GET", &pull_path,
+        ])?)?)?;
+        let runs_path = repository.pull_request_runs_api_path(&pull.head.sha);
+        let latest_failed_runs = find_latest_failed_pull_request_runs_with(&runs_path, |path| {
+            successful_stdout(run_gh(&["api", "-X", "GET", path])?)
+        })?;
+
+        let mut workflows = self.list_workflows(repository)?;
+        workflows.retain(|workflow| latest_failed_runs.contains_key(&workflow.id));
+        for workflow in &mut workflows {
+            workflow.run_status = RunStatus::Failure;
+            workflow.last_completed_run_id = latest_failed_runs.get(&workflow.id).copied();
+        }
+        let targets = workflows
+            .iter()
+            .map(|workflow| (workflow.id, latest_failed_runs[&workflow.id]))
+            .collect::<Vec<_>>();
+        let mut triage = Vec::new();
+        for chunk in targets.chunks(MAX_CONCURRENT_REQUESTS) {
+            let results = thread::scope(|scope| {
+                let handles = chunk
+                    .iter()
+                    .map(|&(workflow_id, run_id)| {
+                        scope.spawn(move || build_run_triage(repository, workflow_id, run_id, true))
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().map_err(|_| Error::StatusWorker)?)
+                    .collect::<Result<Vec<_>, Error>>()
+            })?;
+            triage.extend(results);
+        }
+        Ok(PullRequestTriage {
+            workflows,
+            failures: triage,
+        })
     }
 
     fn triage_run(
@@ -883,6 +954,38 @@ fn find_failed_scheduled_run_with(
         .and_then(|(id, _)| id))
 }
 
+fn find_latest_failed_pull_request_runs_with(
+    runs_path: &str,
+    mut fetch_page: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<BTreeMap<u64, u64>, Error> {
+    let mut latest = BTreeMap::new();
+    let mut page_number = 1;
+    loop {
+        let path = format!("{runs_path}&page={page_number}");
+        let page: WorkflowRunPage = serde_json::from_slice(&fetch_page(&path)?)?;
+        let page_len = page.workflow_runs.len();
+        for run in page.workflow_runs {
+            let (Some(workflow_id), Some(run_id)) = (run.workflow_id, run.id) else {
+                continue;
+            };
+            latest.entry(workflow_id).or_insert_with(|| {
+                (run.status.as_deref() == Some("completed")
+                    && run.conclusion.as_deref() == Some("failure"))
+                .then_some(run_id)
+            });
+        }
+        if page_len < RUNS_PER_PAGE {
+            break;
+        }
+        page_number += 1;
+    }
+
+    Ok(latest
+        .into_iter()
+        .filter_map(|(workflow_id, run_id)| run_id.map(|run_id| (workflow_id, run_id)))
+        .collect())
+}
+
 struct FailedJob {
     job_id: u64,
     job_name: String,
@@ -1173,6 +1276,56 @@ mod tests {
             event: None,
             created_at: now() - age,
         }
+    }
+
+    #[test]
+    fn pull_request_runs_select_latest_failure_per_workflow() {
+        let response = serde_json::to_vec(&json!({
+            "workflow_runs": [
+                {
+                    "id": 30,
+                    "workflow_id": 3,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "event": "pull_request",
+                    "created_at": "2026-09-23T12:00:00Z"
+                },
+                {
+                    "id": 20,
+                    "workflow_id": 2,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "event": "pull_request",
+                    "created_at": "2026-09-23T11:00:00Z"
+                },
+                {
+                    "id": 19,
+                    "workflow_id": 2,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "event": "pull_request",
+                    "created_at": "2026-09-23T10:00:00Z"
+                },
+                {
+                    "id": 10,
+                    "workflow_id": 1,
+                    "status": "in_progress",
+                    "conclusion": null,
+                    "event": "pull_request",
+                    "created_at": "2026-09-23T09:00:00Z"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let runs =
+            find_latest_failed_pull_request_runs_with(
+                "runs?per_page=100",
+                |_| Ok(response.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(runs, BTreeMap::from([(3, 30)]));
     }
 
     #[test]

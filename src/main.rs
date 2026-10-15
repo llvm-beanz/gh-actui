@@ -9,6 +9,7 @@ use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
 use github::{GhWorkflowSource, WorkflowSource};
+use repository::PullRequest;
 use state::ViewState;
 use thiserror::Error;
 
@@ -18,7 +19,7 @@ use thiserror::Error;
     about = "Browse GitHub Actions workflows in an interactive terminal"
 )]
 struct Cli {
-    /// GitHub repository URL, OWNER/REPO, or existing view state file
+    /// GitHub repository or pull request URL, OWNER/REPO, or existing view state file
     target: String,
 }
 
@@ -44,19 +45,30 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli, source: Arc<dyn WorkflowSource>) -> Result<(), Error> {
     let state_path = PathBuf::from(&cli.target);
-    let (repository, workflow_ids, tabs, active_tab, state_path) = if state_path.is_file() {
-        let state = ViewState::load(&state_path)?;
-        (
-            state.repository,
-            Some(state.workflow_ids),
-            Some(state.tabs),
-            state.active_tab,
-            Some(state_path),
-        )
-    } else {
-        let repository = cli.target.parse()?;
-        (repository, None, None, 0, None)
-    };
+    let (repository, workflow_ids, tabs, active_tab, state_path, pull_request_number) =
+        if let Ok(pull_request) = cli.target.parse::<PullRequest>() {
+            (
+                pull_request.repository,
+                None,
+                None,
+                0,
+                None,
+                Some(pull_request.number),
+            )
+        } else if state_path.is_file() {
+            let state = ViewState::load(&state_path)?;
+            (
+                state.repository,
+                Some(state.workflow_ids),
+                Some(state.tabs),
+                state.active_tab,
+                Some(state_path),
+                None,
+            )
+        } else {
+            let repository = cli.target.parse()?;
+            (repository, None, None, 0, None, None)
+        };
     tui::run(
         repository,
         workflow_ids,
@@ -64,6 +76,7 @@ fn run(cli: Cli, source: Arc<dyn WorkflowSource>) -> Result<(), Error> {
         active_tab,
         state_path,
         source,
+        pull_request_number,
     )?;
     Ok(())
 }
