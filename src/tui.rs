@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -24,14 +24,14 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Widget, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Widget, Wrap},
 };
 use regex::Regex;
 
 use crate::{
     github::{
-        MAX_CONCURRENT_REQUESTS, PullRequestTriage, RunCounts, RunStatus, Workflow,
-        WorkflowRunDetail, WorkflowSource, WorkflowTriage,
+        MAX_CONCURRENT_REQUESTS, PullRequestJob, PullRequestTriage, PullRequestView, RunCounts,
+        RunStatus, Workflow, WorkflowRunDetail, WorkflowSource, WorkflowStep, WorkflowTriage,
     },
     query::{FilterExpression, SortSpec, select_workflows},
     repository::{PullRequest, Repository},
@@ -124,6 +124,13 @@ enum TriageResponse {
     PullRequest(PullRequestTriage),
 }
 
+#[derive(Clone, Copy)]
+enum PullRequestViewTarget {
+    New { insert_after: usize },
+    Refresh { index: usize },
+    Replace { index: usize },
+}
+
 #[derive(Clone)]
 struct ListView {
     workflow_ids: Vec<u64>,
@@ -132,6 +139,12 @@ struct ListView {
     filter_expression: Option<FilterExpression>,
     sort: Option<String>,
     sort_spec: Option<SortSpec>,
+}
+
+#[derive(Clone)]
+struct PullRequestStepModal {
+    job: PullRequestJob,
+    table_state: TableState,
 }
 
 impl ListView {
@@ -162,7 +175,7 @@ struct Tab {
     layout: ViewLayout,
     active_view: usize,
     is_triage: bool,
-    triage_pull_request: Option<u64>,
+    pull_request_number: Option<u64>,
     triage_scroll: u16,
     triage_max_scroll: u16,
     details_workflow_id: Option<u64>,
@@ -176,6 +189,10 @@ struct Tab {
     run_triage_log_width: u16,
     run_triage_search_pattern: Option<String>,
     run_triage_search_match: Option<usize>,
+    pull_request_step_modal: Option<PullRequestStepModal>,
+    pull_request_step_job_id: Option<u64>,
+    pull_request_step_title: Option<String>,
+    pull_request_step_log: Option<String>,
 }
 
 impl Tab {
@@ -191,7 +208,7 @@ impl Tab {
             layout: ViewLayout::default(),
             active_view: 0,
             is_triage: false,
-            triage_pull_request: None,
+            pull_request_number: None,
             triage_scroll: 0,
             triage_max_scroll: 0,
             details_workflow_id: None,
@@ -205,6 +222,10 @@ impl Tab {
             run_triage_log_width: 0,
             run_triage_search_pattern: None,
             run_triage_search_match: None,
+            pull_request_step_modal: None,
+            pull_request_step_job_id: None,
+            pull_request_step_title: None,
+            pull_request_step_log: None,
         }
     }
 
@@ -217,11 +238,11 @@ impl Tab {
         );
         Self {
             name: tab.name,
+            pull_request_number: tab.pull_request_number,
             active_view: tab.active_view.min(views.len().saturating_sub(1)),
             views,
             layout: tab.layout,
             is_triage: false,
-            triage_pull_request: None,
             triage_scroll: 0,
             triage_max_scroll: 0,
             details_workflow_id: None,
@@ -235,6 +256,10 @@ impl Tab {
             run_triage_log_width: 0,
             run_triage_search_pattern: None,
             run_triage_search_match: None,
+            pull_request_step_modal: None,
+            pull_request_step_job_id: None,
+            pull_request_step_title: None,
+            pull_request_step_log: None,
         }
     }
 
@@ -278,6 +303,12 @@ struct App {
     triage_receiver: Option<Receiver<Result<TriageResponse, crate::github::Error>>>,
     triage_target: Option<TriageTarget>,
     triage: HashMap<u64, WorkflowTriage>,
+    pull_request_receiver: Option<Receiver<Result<PullRequestView, crate::github::Error>>>,
+    pull_request_target: Option<(PullRequestViewTarget, u64)>,
+    pull_request_jobs: HashMap<u64, PullRequestJob>,
+    pending_pull_request_tabs: VecDeque<(usize, u64)>,
+    step_log_receiver: Option<Receiver<Result<String, crate::github::Error>>>,
+    step_log_target: Option<(usize, u64, String)>,
     run_details_receiver: Option<Receiver<Result<Vec<WorkflowRunDetail>, crate::github::Error>>>,
     run_details_target: Option<usize>,
     run_triage_receiver: Option<Receiver<Result<WorkflowTriage, crate::github::Error>>>,
@@ -299,7 +330,6 @@ struct App {
     next_refresh: Instant,
     pending_ctrl_w: bool,
     pane_areas: Vec<(usize, Rect)>,
-    pending_pull_request: Option<u64>,
 }
 
 impl App {
@@ -341,6 +371,12 @@ impl App {
             triage_receiver: None,
             triage_target: None,
             triage: HashMap::new(),
+            pull_request_receiver: None,
+            pull_request_target: None,
+            pull_request_jobs: HashMap::new(),
+            pending_pull_request_tabs: VecDeque::new(),
+            step_log_receiver: None,
+            step_log_target: None,
             run_details_receiver: None,
             run_details_target: None,
             run_triage_receiver: None,
@@ -362,7 +398,6 @@ impl App {
             next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
             pending_ctrl_w: false,
             pane_areas: Vec::new(),
-            pending_pull_request: None,
         };
         app.repair_all_tab_selections(None);
         app
@@ -392,6 +427,8 @@ impl App {
         while !self.should_quit {
             self.poll_loading();
             self.poll_triage();
+            self.poll_pull_request_view();
+            self.poll_step_log();
             self.poll_run_details();
             self.poll_run_triage();
             self.refresh_if_due();
@@ -540,6 +577,164 @@ impl App {
         self.finish_triage(result.map_err(|error| error.to_string()), target);
     }
 
+    fn poll_pull_request_view(&mut self) {
+        let Some(receiver) = self.pull_request_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.pull_request_receiver = None;
+                self.pull_request_target = None;
+                self.message = Some("E484: pull request loading stopped unexpectedly".to_owned());
+                return;
+            }
+        };
+        self.pull_request_receiver = None;
+        let target = self.pull_request_target.take();
+        match (result, target) {
+            (Ok(result), Some((target, number))) => {
+                let refresh_selections = match target {
+                    PullRequestViewTarget::Refresh { index } if index < self.tabs.len() => Some(
+                        self.tabs[index]
+                            .views
+                            .iter()
+                            .map(|view| {
+                                view.table_state
+                                    .selected()
+                                    .and_then(|selected| {
+                                        self.visible_workflows_for(view).get(selected).copied()
+                                    })
+                                    .map(|workflow| (workflow.id, workflow.name.clone()))
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                };
+                self.pull_request_jobs.extend(result.jobs);
+                let workflow_ids = result
+                    .workflows
+                    .iter()
+                    .map(|workflow| workflow.id)
+                    .collect::<Vec<_>>();
+                for workflow in result.workflows {
+                    if let Some(existing) = self
+                        .workflows
+                        .iter_mut()
+                        .find(|existing| existing.id == workflow.id)
+                    {
+                        *existing = workflow;
+                    } else {
+                        self.workflows.push(workflow);
+                    }
+                }
+                let make_tab = || {
+                    let mut tab = Tab::new(
+                        Some(format!("PR #{number}")),
+                        workflow_ids.clone(),
+                        None,
+                        None,
+                    );
+                    tab.pull_request_number = Some(number);
+                    tab.active_view_mut()
+                        .table_state
+                        .select((!workflow_ids.is_empty()).then_some(0));
+                    tab
+                };
+                match target {
+                    PullRequestViewTarget::New { insert_after } => {
+                        let index = (insert_after + 1).min(self.tabs.len());
+                        self.tabs.insert(index, make_tab());
+                        self.active_tab = index;
+                    }
+                    PullRequestViewTarget::Refresh { index } if index < self.tabs.len() => {
+                        for view in &mut self.tabs[index].views {
+                            view.workflow_ids.clone_from(&workflow_ids);
+                        }
+                        let selections = self.tabs[index]
+                            .views
+                            .iter()
+                            .enumerate()
+                            .map(|(view_index, view)| {
+                                let visible = self.visible_workflows_for(view);
+                                refresh_selections
+                                    .as_ref()
+                                    .and_then(|selections| selections.get(view_index))
+                                    .and_then(|selection| selection.as_ref())
+                                    .and_then(|(id, name)| {
+                                        visible
+                                            .iter()
+                                            .position(|workflow| workflow.id == *id)
+                                            .or_else(|| {
+                                                visible
+                                                    .iter()
+                                                    .position(|workflow| workflow.name == *name)
+                                            })
+                                    })
+                                    .or_else(|| (!visible.is_empty()).then_some(0))
+                            })
+                            .collect::<Vec<_>>();
+                        for (view, selection) in self.tabs[index].views.iter_mut().zip(selections) {
+                            view.table_state.select(selection);
+                        }
+                    }
+                    PullRequestViewTarget::Replace { index } if index < self.tabs.len() => {
+                        self.tabs[index] = make_tab();
+                        self.active_tab = index;
+                    }
+                    _ => {
+                        self.message =
+                            Some("E484: pull request destination is unavailable".to_owned());
+                        return;
+                    }
+                }
+                self.message = Some(format!(
+                    "{} pull request workflows loaded",
+                    workflow_ids.len()
+                ));
+            }
+            (Err(error), _) => self.message = Some(format!("E484: {error}")),
+            (Ok(_), None) => {
+                self.message = Some("E484: pull request destination is unavailable".to_owned())
+            }
+        }
+        self.start_next_persisted_pull_request();
+    }
+
+    fn poll_step_log(&mut self) {
+        let Some(receiver) = self.step_log_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.step_log_receiver = None;
+                self.step_log_target = None;
+                self.message = Some("E484: step log loading stopped unexpectedly".to_owned());
+                return;
+            }
+        };
+        self.step_log_receiver = None;
+        let target = self.step_log_target.take();
+        match (result, target) {
+            (Ok(log), Some((index, job_id, step_name)))
+                if self.tabs.get(index).is_some_and(|tab| {
+                    tab.pull_request_step_job_id == Some(job_id)
+                        && tab.pull_request_step_title.as_deref() == Some(step_name.as_str())
+                }) =>
+            {
+                self.tabs[index].pull_request_step_log = Some(log);
+                self.message = Some(format!("{step_name} log loaded"));
+            }
+            (Ok(_), _) => {
+                self.message = Some("E484: step log destination is unavailable".to_owned())
+            }
+            (Err(error), _) => self.message = Some(format!("E484: {error}")),
+        }
+    }
+
     fn poll_run_details(&mut self) {
         let Some(receiver) = self.run_details_receiver.as_ref() else {
             return;
@@ -686,7 +881,7 @@ impl App {
                     }) => {
                         let mut tab = Tab::new(Some("Triage".to_owned()), workflow_ids, None, None);
                         tab.is_triage = true;
-                        tab.triage_pull_request = pull_request_number;
+                        tab.pull_request_number = pull_request_number;
                         let has_workflows = !tab.active_view().workflow_ids.is_empty();
                         tab.active_view_mut()
                             .table_state
@@ -786,7 +981,7 @@ impl App {
             return;
         };
 
-        let start_pull_request = result.is_ok() && pending.kind == LoadKind::Initial;
+        let restore_pull_requests = result.is_ok() && pending.kind != LoadKind::Refresh;
         match result {
             Ok(()) => {
                 let completed = match pending.kind {
@@ -807,8 +1002,14 @@ impl App {
             Err(error) => self.message = Some(format!("E484: {error}")),
         }
         self.next_refresh = Instant::now() + self.refresh_interval;
-        if start_pull_request && let Some(number) = self.pending_pull_request.take() {
-            self.start_pull_request_triage(number);
+        if restore_pull_requests {
+            self.pending_pull_request_tabs = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, tab)| tab.pull_request_number.map(|number| (index, number)))
+                .collect();
+            self.start_next_persisted_pull_request();
         }
     }
 
@@ -905,17 +1106,25 @@ impl App {
     fn refresh_if_due(&mut self) {
         if !self.is_loading()
             && self.triage_receiver.is_none()
+            && self.pull_request_receiver.is_none()
             && self.run_details_receiver.is_none()
             && self.run_triage_receiver.is_none()
             && Instant::now() >= self.next_refresh
         {
-            self.refresh_workflows();
+            self.refresh();
         }
     }
 
     fn refresh(&mut self) {
         if self.active_tab().is_triage {
             self.refresh_triage();
+        } else if let Some(number) = self.active_tab().pull_request_number {
+            self.start_pull_request_view(
+                number,
+                PullRequestViewTarget::Refresh {
+                    index: self.active_tab,
+                },
+            );
         } else if self.active_tab().details_workflow_id.is_some() {
             self.refresh_run_details(self.active_tab);
         } else {
@@ -926,6 +1135,7 @@ impl App {
     fn refresh_workflows(&mut self) {
         if self.is_loading()
             || self.triage_receiver.is_some()
+            || self.pull_request_receiver.is_some()
             || self.run_details_receiver.is_some()
             || self.run_triage_receiver.is_some()
         {
@@ -952,6 +1162,11 @@ impl App {
             (
                 " TRIAGING ",
                 "Analyzing scheduled failures, jobs, steps, and logs...".to_owned(),
+            )
+        } else if self.pull_request_receiver.is_some() {
+            (
+                " LOADING ",
+                "Loading pull request workflow status...".to_owned(),
             )
         } else if self.run_triage_receiver.is_some() {
             (
@@ -985,7 +1200,9 @@ impl App {
         } else {
             let default_message = if self.active_tab().is_triage {
                 "j/k: scroll  |  Ctrl-d/Ctrl-u: page  |  Home/End: first/last  |  :q: quit"
-            } else if self.active_tab().run_triage.is_some() {
+            } else if self.active_tab().run_triage.is_some()
+                || self.active_tab().pull_request_step_job_id.is_some()
+            {
                 "j/k: scroll  |  /?: regex search  |  n/N: next/previous match  |  Esc: close"
             } else {
                 "j/k: select  |  Ctrl-d/Ctrl-u: scroll  |  Ctrl-Tab: next tab  |  :q: quit"
@@ -1027,6 +1244,10 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if self.handle_pull_request_step_modal_key(key.code) {
+            return;
+        }
 
         if self.pending_ctrl_w {
             self.pending_ctrl_w = false;
@@ -1098,9 +1319,16 @@ impl App {
                 tab.run_triage_search_pattern = None;
                 tab.run_triage_search_match = None;
             }
+            KeyCode::Esc if self.active_tab().pull_request_step_job_id.is_some() => {
+                self.close_pull_request_step_log();
+            }
             KeyCode::Enter => {
                 if self.active_tab().details_workflow_id.is_some() {
                     self.start_selected_run_triage();
+                } else if self.active_tab().pull_request_number.is_some()
+                    && self.active_tab().pull_request_step_job_id.is_none()
+                {
+                    self.open_pull_request_step_modal();
                 } else {
                     self.open_workflow_details();
                 }
@@ -1232,7 +1460,20 @@ impl App {
     }
 
     fn run_triage_log_is_active(&self) -> bool {
-        self.active_tab().run_triage.is_some() && self.active_tab().run_triage_block == 1
+        self.active_tab().pull_request_step_log.is_some()
+            || (self.active_tab().run_triage.is_some() && self.active_tab().run_triage_block == 1)
+    }
+
+    fn active_log_text(&self) -> Option<&str> {
+        self.active_tab()
+            .pull_request_step_log
+            .as_deref()
+            .or_else(|| {
+                self.active_tab()
+                    .run_triage
+                    .as_ref()
+                    .map(|triage| triage.failed_step_log.as_str())
+            })
     }
 
     fn start_search(&mut self, direction: SearchDirection) {
@@ -1271,22 +1512,22 @@ impl App {
                 return;
             }
         };
-        let tab = self.active_tab();
-        let Some(triage) = tab.run_triage.as_ref() else {
+        let Some(log) = self.active_log_text().map(ToOwned::to_owned) else {
             self.finish_command();
             return;
         };
+        let tab = self.active_tab();
         let width = tab.run_triage_log_width;
         let scroll = tab.run_triage_scroll;
         let previous_match = (tab.run_triage_search_pattern.as_deref() == Some(pattern.as_str()))
             .then_some(tab.run_triage_search_match)
             .flatten();
         let matches = regex
-            .find_iter(&triage.failed_step_log)
+            .find_iter(&log)
             .map(|matched| {
                 (
                     matched.start(),
-                    wrapped_row_for_byte(&triage.failed_step_log, matched.start(), width),
+                    wrapped_row_for_byte(&log, matched.start(), width),
                 )
             })
             .collect::<Vec<_>>();
@@ -1373,6 +1614,7 @@ impl App {
             "resize" => self.resize_command(argument),
             "tabnew" => self.tab_new(argument),
             "tabsetname" => self.tab_set_name(argument),
+            "pr" => self.start_pull_request_view_url(argument),
             "triage" => match argument {
                 Some(url) => self.start_pull_request_triage_url(url),
                 None => self.start_triage(),
@@ -1501,6 +1743,7 @@ impl App {
                     index,
                     ViewTab {
                         name: tab.name.clone(),
+                        pull_request_number: tab.pull_request_number,
                         workflow_ids: primary.workflow_ids.clone(),
                         filter: primary.filter.clone(),
                         sort: primary.sort.clone(),
@@ -1516,6 +1759,7 @@ impl App {
             return (
                 vec![ViewTab {
                     name: None,
+                    pull_request_number: None,
                     workflow_ids: self.workflows.iter().map(|workflow| workflow.id).collect(),
                     filter: None,
                     sort: None,
@@ -1887,9 +2131,144 @@ impl App {
         self.message = None;
     }
 
+    fn open_pull_request_step_modal(&mut self) {
+        let Some(workflow_id) = self
+            .active_view()
+            .table_state
+            .selected()
+            .and_then(|selected| self.visible_workflows().get(selected).copied())
+            .map(|workflow| workflow.id)
+        else {
+            self.message = Some("E749: Empty buffer".to_owned());
+            return;
+        };
+        let Some(job) = self.pull_request_jobs.get(&workflow_id).cloned() else {
+            self.message = Some("E484: Job details are unavailable".to_owned());
+            return;
+        };
+        let mut table_state = TableState::default();
+        table_state.select((!job.steps.is_empty()).then_some(0));
+        self.active_tab_mut().pull_request_step_modal =
+            Some(PullRequestStepModal { job, table_state });
+        self.message = None;
+    }
+
+    fn handle_pull_request_step_modal_key(&mut self, code: KeyCode) -> bool {
+        let Some(modal) = self.active_tab().pull_request_step_modal.as_ref() else {
+            return false;
+        };
+        let count = modal.job.steps.len();
+        match code {
+            KeyCode::Esc => self.active_tab_mut().pull_request_step_modal = None,
+            KeyCode::Enter => self.open_selected_pull_request_step_log(),
+            KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                let selected = modal.table_state.selected().unwrap_or(0);
+                self.active_tab_mut()
+                    .pull_request_step_modal
+                    .as_mut()
+                    .unwrap()
+                    .table_state
+                    .select(Some((selected + 1).min(count - 1)));
+            }
+            KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+                let selected = modal.table_state.selected().unwrap_or(0);
+                self.active_tab_mut()
+                    .pull_request_step_modal
+                    .as_mut()
+                    .unwrap()
+                    .table_state
+                    .select(Some(selected.saturating_sub(1)));
+            }
+            KeyCode::Home if count > 0 => self
+                .active_tab_mut()
+                .pull_request_step_modal
+                .as_mut()
+                .unwrap()
+                .table_state
+                .select(Some(0)),
+            KeyCode::End if count > 0 => self
+                .active_tab_mut()
+                .pull_request_step_modal
+                .as_mut()
+                .unwrap()
+                .table_state
+                .select(Some(count - 1)),
+            _ => {}
+        }
+        true
+    }
+
+    fn open_selected_pull_request_step_log(&mut self) {
+        if self.step_log_receiver.is_some() {
+            self.message = Some("A step log is already loading".to_owned());
+            return;
+        }
+        let Some((job_id, title, step)) = self
+            .active_tab()
+            .pull_request_step_modal
+            .as_ref()
+            .and_then(|modal| {
+                modal
+                    .table_state
+                    .selected()
+                    .and_then(|selected| modal.job.steps.get(selected))
+                    .map(|step| {
+                        (
+                            modal.job.id,
+                            format!("{} / {}", modal.job.name, step.name),
+                            step.clone(),
+                        )
+                    })
+            })
+        else {
+            self.message = Some("E749: Empty buffer".to_owned());
+            return;
+        };
+        let tab_index = self.active_tab;
+        let tab = self.active_tab_mut();
+        tab.pull_request_step_modal = None;
+        tab.pull_request_step_job_id = Some(job_id);
+        tab.pull_request_step_title = Some(title.clone());
+        tab.pull_request_step_log = None;
+        tab.run_triage_block = 1;
+        tab.run_triage_scroll = 0;
+        tab.run_triage_max_scroll = 0;
+        tab.run_triage_log_width = 0;
+        tab.run_triage_search_pattern = None;
+        tab.run_triage_search_match = None;
+
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.load_job_step_log(&repository, job_id, &step));
+        });
+        self.step_log_receiver = Some(receiver);
+        self.step_log_target = Some((tab_index, job_id, title));
+        self.message = None;
+    }
+
+    fn close_pull_request_step_log(&mut self) {
+        self.step_log_receiver = None;
+        self.step_log_target = None;
+        let tab = self.active_tab_mut();
+        tab.pull_request_step_job_id = None;
+        tab.pull_request_step_title = None;
+        tab.pull_request_step_log = None;
+        tab.run_triage_scroll = 0;
+        tab.run_triage_max_scroll = 0;
+        tab.run_triage_log_width = 0;
+        tab.run_triage_search_pattern = None;
+        tab.run_triage_search_match = None;
+    }
+
     fn start_triage(&mut self) {
         if self.triage_receiver.is_some() {
             self.message = Some("Triage already in progress".to_owned());
+            return;
+        }
+        if let Some(number) = self.active_tab().pull_request_number {
+            self.start_pull_request_triage(number);
             return;
         }
         let workflows = self
@@ -1937,6 +2316,58 @@ impl App {
         self.start_pull_request_triage(pull_request.number);
     }
 
+    fn start_pull_request_view_url(&mut self, url: Option<&str>) {
+        let Some(url) = url.filter(|url| !url.is_empty()) else {
+            self.message = Some("E471: Argument required".to_owned());
+            return;
+        };
+        let pull_request = match url.parse::<PullRequest>() {
+            Ok(pull_request) => pull_request,
+            Err(error) => {
+                self.message = Some(format!("E474: Invalid pull request URL: {error}"));
+                return;
+            }
+        };
+        if pull_request.repository != self.repository {
+            self.message = Some(format!(
+                "E474: Pull request belongs to {}, not {}",
+                pull_request.repository, self.repository
+            ));
+            return;
+        }
+        self.start_pull_request_view(
+            pull_request.number,
+            PullRequestViewTarget::New {
+                insert_after: self.active_tab,
+            },
+        );
+    }
+
+    fn start_pull_request_view(&mut self, pull_request_number: u64, target: PullRequestViewTarget) {
+        if self.pull_request_receiver.is_some() {
+            self.message = Some("Pull request loading already in progress".to_owned());
+            return;
+        }
+        let source = Arc::clone(&self.workflow_source);
+        let repository = self.repository.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(source.load_pull_request(&repository, pull_request_number));
+        });
+        self.pull_request_receiver = Some(receiver);
+        self.pull_request_target = Some((target, pull_request_number));
+        self.message = None;
+    }
+
+    fn start_next_persisted_pull_request(&mut self) {
+        if self.pull_request_receiver.is_some() {
+            return;
+        }
+        if let Some((index, number)) = self.pending_pull_request_tabs.pop_front() {
+            self.start_pull_request_view(number, PullRequestViewTarget::Refresh { index });
+        }
+    }
+
     fn start_pull_request_triage(&mut self, pull_request_number: u64) {
         if self.triage_receiver.is_some() {
             self.message = Some("Triage already in progress".to_owned());
@@ -1976,7 +2407,7 @@ impl App {
         let source = Arc::clone(&self.workflow_source);
         let repository = self.repository.clone();
         let target = self.active_tab;
-        let pull_request_number = self.active_tab().triage_pull_request;
+        let pull_request_number = self.active_tab().pull_request_number;
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = match pull_request_number {
@@ -2093,6 +2524,14 @@ impl App {
     }
 
     fn select_next(&mut self, amount: usize) {
+        if self.active_tab().pull_request_step_job_id.is_some() {
+            let tab = self.active_tab_mut();
+            tab.run_triage_scroll = tab
+                .run_triage_scroll
+                .saturating_add(amount as u16)
+                .min(tab.run_triage_max_scroll);
+            return;
+        }
         if self.active_tab().is_triage {
             let tab = self.active_tab_mut();
             tab.triage_scroll = tab
@@ -2135,6 +2574,11 @@ impl App {
     }
 
     fn select_previous(&mut self, amount: usize) {
+        if self.active_tab().pull_request_step_job_id.is_some() {
+            let tab = self.active_tab_mut();
+            tab.run_triage_scroll = tab.run_triage_scroll.saturating_sub(amount as u16);
+            return;
+        }
         if self.active_tab().is_triage {
             let tab = self.active_tab_mut();
             tab.triage_scroll = tab.triage_scroll.saturating_sub(amount as u16);
@@ -2167,6 +2611,10 @@ impl App {
     }
 
     fn select_first(&mut self) {
+        if self.active_tab().pull_request_step_job_id.is_some() {
+            self.active_tab_mut().run_triage_scroll = 0;
+            return;
+        }
         if self.active_tab().is_triage {
             self.active_tab_mut().triage_scroll = 0;
             return;
@@ -2189,6 +2637,11 @@ impl App {
     }
 
     fn select_last(&mut self) {
+        if self.active_tab().pull_request_step_job_id.is_some() {
+            let max_scroll = self.active_tab().run_triage_max_scroll;
+            self.active_tab_mut().run_triage_scroll = max_scroll;
+            return;
+        }
         if self.active_tab().is_triage {
             let max_scroll = self.active_tab().triage_max_scroll;
             self.active_tab_mut().triage_scroll = max_scroll;
@@ -2268,6 +2721,8 @@ impl App {
             if visible_workflows.is_empty() {
                 let empty_message = if self.triage_receiver.is_some() {
                     "Triaging failing workflows..."
+                } else if self.active_tab().pull_request_number.is_some() {
+                    "No failed pull request workflows were found."
                 } else {
                     "No failing scheduled workflows were found."
                 };
@@ -2357,6 +2812,72 @@ impl App {
                     );
                 }
             }
+        } else if self.active_tab().pull_request_step_job_id.is_some() {
+            let [list_area, log_area] =
+                Layout::horizontal([Constraint::Percentage(20), Constraint::Percentage(80)])
+                    .areas(table_area);
+            self.pane_areas
+                .push((self.active_tab().active_view, list_area));
+            let active_tab = self.active_tab;
+            let view_index = self.tabs[active_tab].active_view;
+            let workflows = self
+                .visible_workflows_for(&self.tabs[active_tab].views[view_index])
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let repository = self.repository.clone();
+            let loading_status_ids = self.loading_status_ids.clone();
+            render_list_view(
+                frame,
+                list_area,
+                &repository,
+                &workflows,
+                &mut self.tabs[active_tab].views[view_index].table_state,
+                true,
+                false,
+                false,
+                flash_visible(self.animation_started.elapsed()),
+                &loading_status_ids,
+                false,
+            );
+            let loading_log = self.step_log_receiver.is_some()
+                && self
+                    .step_log_target
+                    .as_ref()
+                    .is_some_and(|(index, _, _)| *index == active_tab);
+            let tab = &mut self.tabs[active_tab];
+            let title = tab.pull_request_step_title.as_deref().unwrap_or("Step log");
+            if loading_log {
+                frame.render_widget(
+                    Paragraph::new("Loading selected step log...").block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(" {title} ")),
+                    ),
+                    log_area,
+                );
+            } else if let Some(log) = tab.pull_request_step_log.as_deref() {
+                tab.run_triage_log_width = log_area.width;
+                tab.run_triage_max_scroll = render_step_log(
+                    frame,
+                    log_area,
+                    title,
+                    log,
+                    tab.run_triage_scroll,
+                    tab.run_triage_search_pattern.as_deref(),
+                    tab.run_triage_search_match,
+                );
+                tab.run_triage_scroll = tab.run_triage_scroll.min(tab.run_triage_max_scroll);
+            } else {
+                frame.render_widget(
+                    Paragraph::new("(step log unavailable)").block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(" {title} ")),
+                    ),
+                    log_area,
+                );
+            }
         } else {
             let pane_areas = layout_areas(&self.active_tab().layout, table_area);
             self.pane_areas.clone_from(&pane_areas);
@@ -2372,6 +2893,7 @@ impl App {
                 let active = view_index == self.tabs[active_tab].active_view;
                 let repository = self.repository.clone();
                 let loading = self.is_loading();
+                let show_history = self.tabs[active_tab].pull_request_number.is_none();
                 let flash = flash_visible(self.animation_started.elapsed());
                 render_list_view(
                     frame,
@@ -2384,8 +2906,13 @@ impl App {
                     is_filtered,
                     flash,
                     &loading_status_ids,
+                    show_history,
                 );
             }
+        }
+
+        if let Some(modal) = self.tabs[self.active_tab].pull_request_step_modal.as_mut() {
+            render_pull_request_step_modal(frame, table_area, modal);
         }
 
         match self.mode {
@@ -2475,6 +3002,79 @@ impl App {
         }
         total_height.saturating_sub(area.height)
     }
+}
+
+fn render_step_log(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    log: &str,
+    scroll: u16,
+    search_pattern: Option<&str>,
+    search_match: Option<usize>,
+) -> u16 {
+    let text = if log.is_empty() {
+        Text::from("(step produced no log output)")
+    } else {
+        highlighted_log_text(log, search_pattern, search_match)
+    };
+    let max_scroll = triage_block_height(&text, area.width).saturating_sub(area.height);
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(max_scroll), 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {title} ")),
+            ),
+        area,
+    );
+    max_scroll
+}
+
+fn render_pull_request_step_modal(frame: &mut Frame, area: Rect, modal: &mut PullRequestStepModal) {
+    let width = area.width.saturating_mul(3).saturating_div(4).max(20);
+    let height = (modal.job.steps.len() as u16)
+        .saturating_add(2)
+        .clamp(3, area.height.saturating_mul(4).saturating_div(5).max(3));
+    let popup = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width.min(area.width),
+        height.min(area.height),
+    );
+    frame.render_widget(Clear, popup);
+    let rows = modal.job.steps.iter().map(|step| {
+        let (color, indicator) = step_status_indicator(step);
+        Row::new(vec![
+            Cell::from(indicator).style(Style::default().fg(color)),
+            Cell::from(step.name.as_str()),
+        ])
+    });
+    let table = Table::new(rows, [Constraint::Length(2), Constraint::Fill(1)])
+        .row_highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} steps ", modal.job.name)),
+        );
+    frame.render_stateful_widget(table, popup, &mut modal.table_state);
+}
+
+fn step_status_indicator(step: &WorkflowStep) -> (Color, &'static str) {
+    let color = match step.conclusion.as_deref() {
+        Some("success") => Color::Green,
+        Some("failure" | "cancelled" | "timed_out" | "startup_failure") => Color::Red,
+        Some("skipped" | "neutral") => Color::White,
+        _ => Color::Yellow,
+    };
+    (color, "●")
 }
 
 fn render_run_triage_blocks(
@@ -2856,6 +3456,7 @@ fn render_list_view(
     is_filtered: bool,
     flash_visible: bool,
     loading_status_ids: &BTreeSet<u64>,
+    show_history: bool,
 ) {
     let border_style = if active {
         Style::default()
@@ -2884,59 +3485,68 @@ fn render_list_view(
         return;
     }
 
-    let header = Row::new([
-        "Status",
-        "Name",
-        "Failing Steps",
-        "24 Hours",
-        "7 Days",
-        "14 Days",
-    ])
-    .style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-    .bottom_margin(1);
+    let mut headings = vec!["Status", "Name", "Failing Steps"];
+    if show_history {
+        headings.extend(["24 Hours", "7 Days", "14 Days"]);
+    }
+    let header = Row::new(headings)
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
     let rows = workflows.iter().map(|workflow| {
         if loading_status_ids.contains(&workflow.id) {
-            return Row::new([
+            let mut cells = vec![
                 Cell::from("..."),
                 Cell::from(workflow.name.as_str()),
                 Cell::from("loading..."),
-                Cell::from("loading..."),
-                Cell::from("loading..."),
-                Cell::from("loading..."),
-            ]);
+            ];
+            if show_history {
+                cells.extend([
+                    Cell::from("loading..."),
+                    Cell::from("loading..."),
+                    Cell::from("loading..."),
+                ]);
+            }
+            return Row::new(cells);
         }
-        Row::new([
+        let mut cells = vec![
             Cell::from(status_indicator(workflow, flash_visible)),
             Cell::from(workflow.name.as_str()),
             Cell::from(workflow.failing_steps.as_deref().unwrap_or("-")),
-            metrics_cell(workflow.run_metrics.last_24_hours),
-            metrics_cell(workflow.run_metrics.last_7_days),
-            metrics_cell(workflow.run_metrics.last_14_days),
-        ])
+        ];
+        if show_history {
+            cells.extend([
+                metrics_cell(workflow.run_metrics.last_24_hours),
+                metrics_cell(workflow.run_metrics.last_7_days),
+                metrics_cell(workflow.run_metrics.last_14_days),
+            ]);
+        }
+        Row::new(cells)
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Min(20),
-            Constraint::Min(24),
+    let mut constraints = vec![
+        Constraint::Length(8),
+        Constraint::Min(20),
+        Constraint::Min(24),
+    ];
+    if show_history {
+        constraints.extend([
             Constraint::Length(19),
             Constraint::Length(19),
             Constraint::Length(19),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol(">> ")
-    .block(block);
+        ]);
+    }
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ")
+        .block(block);
     frame.render_stateful_widget(table, area, table_state);
 }
 
@@ -3507,15 +4117,21 @@ pub fn run(
         ratatui::restore();
         return Err(error);
     }
-    let mut app = App::new_loading(
-        repository,
-        workflow_ids,
-        state_path,
-        workflow_source,
-        tabs,
-        active_tab,
-    );
-    app.pending_pull_request = pull_request_number;
+    let mut app = match pull_request_number {
+        Some(number) => {
+            let mut app = App::new(repository, Vec::new(), state_path, workflow_source, None);
+            app.start_pull_request_view(number, PullRequestViewTarget::Replace { index: 0 });
+            app
+        }
+        None => App::new_loading(
+            repository,
+            workflow_ids,
+            state_path,
+            workflow_source,
+            tabs,
+            active_tab,
+        ),
+    };
     if let Some(path) = command_history_path() {
         match load_command_history(&path) {
             Ok(history) => app.command_history = history,
@@ -3623,6 +4239,62 @@ mod tests {
                     },
                 ],
             })
+        }
+
+        fn load_pull_request(
+            &self,
+            _repository: &Repository,
+            _pull_request_number: u64,
+        ) -> Result<PullRequestView, crate::github::Error> {
+            let mut debug = workflow(300);
+            debug.name = "Pull Request Workflow / Test (debug)".to_owned();
+            debug.run_status = RunStatus::Success;
+            let mut release = workflow(301);
+            release.name = "Pull Request Workflow / Test (release)".to_owned();
+            release.run_status = RunStatus::Failure;
+            release.failing_steps = Some("Test".to_owned());
+            let step = |name: &str, status: &str, conclusion: Option<&str>| WorkflowStep {
+                name: name.to_owned(),
+                status: Some(status.to_owned()),
+                conclusion: conclusion.map(str::to_owned),
+                started_at: None,
+                completed_at: None,
+            };
+            Ok(PullRequestView {
+                workflows: vec![debug, release],
+                jobs: BTreeMap::from([
+                    (
+                        300,
+                        PullRequestJob {
+                            id: 900,
+                            name: "Test (debug)".to_owned(),
+                            steps: vec![
+                                step("Checkout", "completed", Some("success")),
+                                step("Tests", "completed", Some("failure")),
+                                step("Upload", "completed", Some("skipped")),
+                                step("Cleanup", "in_progress", None),
+                            ],
+                        },
+                    ),
+                    (
+                        301,
+                        PullRequestJob {
+                            id: 901,
+                            name: "Test (release)".to_owned(),
+                            steps: vec![step("Tests", "completed", Some("failure"))],
+                        },
+                    ),
+                ]),
+            })
+        }
+
+        fn load_job_step_log(
+            &self,
+            _repository: &Repository,
+            job_id: u64,
+            step: &WorkflowStep,
+        ) -> Result<String, crate::github::Error> {
+            Ok(format!("Job {job_id}\n{}\nneedle in step log", step.name))
         }
 
         fn list_workflow_runs(
@@ -3803,6 +4475,54 @@ mod tests {
         app.finish_triage(result, target);
     }
 
+    fn complete_pull_request_view(app: &mut App) {
+        let result = app
+            .pull_request_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        app.pull_request_receiver = None;
+        let target = app.pull_request_target.take();
+        match (result, target) {
+            (Ok(result), Some((target, number))) => {
+                app.pull_request_jobs.extend(result.jobs);
+                let workflow_ids = result
+                    .workflows
+                    .iter()
+                    .map(|workflow| workflow.id)
+                    .collect::<Vec<_>>();
+                for workflow in result.workflows {
+                    if let Some(existing) = app
+                        .workflows
+                        .iter_mut()
+                        .find(|existing| existing.id == workflow.id)
+                    {
+                        *existing = workflow;
+                    } else {
+                        app.workflows.push(workflow);
+                    }
+                }
+                let mut tab = Tab::new(Some(format!("PR #{number}")), workflow_ids, None, None);
+                tab.pull_request_number = Some(number);
+                tab.table_state.select(Some(0));
+                match target {
+                    PullRequestViewTarget::New { insert_after } => {
+                        let index = insert_after + 1;
+                        app.tabs.insert(index, tab);
+                        app.active_tab = index;
+                    }
+                    PullRequestViewTarget::Refresh { index }
+                    | PullRequestViewTarget::Replace { index } => {
+                        app.tabs[index] = tab;
+                        app.active_tab = index;
+                    }
+                }
+            }
+            _ => panic!("pull request view did not load"),
+        }
+    }
+
     fn complete_run_details(app: &mut App) {
         let result = app
             .run_details_receiver
@@ -3818,6 +4538,24 @@ mod tests {
         app.tabs[target]
             .run_table_state
             .select((count > 0).then_some(0));
+    }
+
+    fn complete_step_log(app: &mut App) {
+        let result = app
+            .step_log_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        app.step_log_receiver = None;
+        let (target, job_id, title) = app.step_log_target.take().unwrap();
+        assert_eq!(app.tabs[target].pull_request_step_job_id, Some(job_id));
+        assert_eq!(
+            app.tabs[target].pull_request_step_title.as_deref(),
+            Some(title.as_str())
+        );
+        app.tabs[target].pull_request_step_log = Some(result);
     }
 
     fn complete_run_triage(app: &mut App) {
@@ -5239,27 +5977,163 @@ mod tests {
     }
 
     #[test]
-    fn startup_pull_request_triage_starts_after_initial_load() {
-        let repository = "owner/repository".parse().unwrap();
-        let mut app = App::new_loading(
-            repository,
+    fn pull_request_command_opens_saveable_status_view_and_triages_in_context() {
+        let mut app = app(2);
+
+        enter_command(&mut app, "pr https://github.com/owner/repository/pull/42");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.pull_request_receiver.is_some());
+        complete_pull_request_view(&mut app);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab().name.as_deref(), Some("PR #42"));
+        assert_eq!(app.active_tab().pull_request_number, Some(42));
+        assert_eq!(app.active_tab().workflow_ids, vec![300, 301]);
+        assert_eq!(app.visible_workflows()[0].run_status, RunStatus::Success);
+        assert_eq!(app.visible_workflows()[1].run_status, RunStatus::Failure);
+        assert_eq!(
+            app.visible_workflows()[0].run_metrics,
+            crate::github::RunMetrics::default()
+        );
+        let (tabs, _) = app.persisted_tabs();
+        assert_eq!(tabs[1].pull_request_number, Some(42));
+
+        let mut restored = App::new_loading(
+            "owner/repository".parse().unwrap(),
             None,
             None,
             Arc::new(TestWorkflowSource),
-            None,
-            0,
+            Some(tabs),
+            1,
         );
-        app.pending_pull_request = Some(42);
+        complete_loading(&mut restored);
+        assert!(restored.pull_request_receiver.is_some());
+        complete_pull_request_view(&mut restored);
+        assert_eq!(restored.active_tab, 1);
+        assert_eq!(restored.active_tab().pull_request_number, Some(42));
+        assert_eq!(restored.active_tab().workflow_ids, vec![300, 301]);
 
-        complete_loading(&mut app);
-
+        enter_command(&mut app, "triage");
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.triage_receiver.is_some());
         complete_triage(&mut app);
-        assert_eq!(app.active_tab().workflow_ids, vec![200, 201]);
+        assert!(app.active_tab().is_triage);
+        assert_eq!(app.active_tab().pull_request_number, Some(42));
+    }
+
+    #[test]
+    fn pull_request_job_steps_open_modal_and_searchable_log_split() {
+        let mut app = app(2);
+        app.start_pull_request_view(42, PullRequestViewTarget::Replace { index: 0 });
+        complete_pull_request_view(&mut app);
+
+        let steps = &app.pull_request_jobs[&300].steps;
+        assert_eq!(step_status_indicator(&steps[0]).0, Color::Green);
+        assert_eq!(step_status_indicator(&steps[1]).0, Color::Red);
+        assert_eq!(step_status_indicator(&steps[2]).0, Color::White);
+        assert_eq!(step_status_indicator(&steps[3]).0, Color::Yellow);
+
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(
-            app.visible_workflows()[0].name,
-            "Pull Request Workflow / Test (debug)"
+            app.active_tab()
+                .pull_request_step_modal
+                .as_ref()
+                .unwrap()
+                .table_state
+                .selected(),
+            Some(0)
         );
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.active_tab()
+                .pull_request_step_modal
+                .as_ref()
+                .unwrap()
+                .table_state
+                .selected(),
+            Some(1)
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.active_tab().pull_request_step_modal.is_none());
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.active_tab().pull_request_step_modal.is_none());
+        assert_eq!(app.active_tab().pull_request_step_job_id, Some(900));
+        assert!(app.step_log_receiver.is_some());
+        complete_step_log(&mut app);
+        assert!(
+            app.active_tab()
+                .pull_request_step_log
+                .as_deref()
+                .unwrap()
+                .contains("needle in step log")
+        );
+
+        app.active_tab_mut().run_triage_log_width = 80;
+        app.active_tab_mut().run_triage_max_scroll = 10;
+        enter_search(&mut app, '/', "needle");
+        assert_eq!(
+            app.active_tab().run_triage_search_pattern.as_deref(),
+            Some("needle")
+        );
+        assert!(app.active_tab().run_triage_search_match.is_some());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.active_tab().pull_request_step_job_id.is_none());
+        assert!(app.active_tab().pull_request_step_log.is_none());
+    }
+
+    #[test]
+    fn pull_request_refresh_preserves_selection_and_open_steps_modal() {
+        let mut app = app(2);
+        app.start_pull_request_view(42, PullRequestViewTarget::Replace { index: 0 });
+        complete_pull_request_view(&mut app);
+        app.select_next(1);
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        complete_step_log(&mut app);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active_tab().table_state.selected(), Some(1));
+        assert!(app.active_tab().pull_request_step_modal.is_some());
+
+        let result = TestWorkflowSource.load_pull_request(&app.repository, 42);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(result).unwrap();
+        app.pull_request_receiver = Some(receiver);
+        app.pull_request_target = Some((
+            PullRequestViewTarget::Refresh {
+                index: app.active_tab,
+            },
+            42,
+        ));
+        app.poll_pull_request_view();
+
+        assert_eq!(app.active_tab().table_state.selected(), Some(1));
+        assert!(app.active_tab().pull_request_step_modal.is_some());
+    }
+
+    #[test]
+    fn startup_pull_request_opens_view_without_general_loading() {
+        let repository = "owner/repository".parse().unwrap();
+        let mut app = App::new(
+            repository,
+            Vec::new(),
+            None,
+            Arc::new(TestWorkflowSource),
+            None,
+        );
+        app.start_pull_request_view(42, PullRequestViewTarget::Replace { index: 0 });
+
+        assert!(!app.is_loading());
+        assert!(app.pull_request_receiver.is_some());
+        assert!(app.triage_receiver.is_none());
+        complete_pull_request_view(&mut app);
+        assert_eq!(app.active_tab().pull_request_number, Some(42));
+        assert_eq!(app.active_tab().workflow_ids, vec![300, 301]);
     }
 
     #[test]

@@ -110,6 +110,28 @@ struct WorkflowRun {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullRequestView {
+    pub workflows: Vec<Workflow>,
+    pub jobs: BTreeMap<u64, PullRequestJob>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullRequestJob {
+    pub id: u64,
+    pub name: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 impl From<WorkflowRun> for CachedRun {
     fn from(run: WorkflowRun) -> Self {
         Self {
@@ -159,6 +181,7 @@ struct PullRequestHead {
 struct Job {
     id: u64,
     name: String,
+    status: Option<String>,
     conclusion: Option<String>,
     #[serde(default)]
     steps: Vec<JobStep>,
@@ -214,6 +237,21 @@ pub trait WorkflowSource: Send + Sync {
         _repository: &Repository,
         _pull_request_number: u64,
     ) -> Result<PullRequestTriage, Error> {
+        Err(Error::RunTriageUnavailable)
+    }
+    fn load_pull_request(
+        &self,
+        _repository: &Repository,
+        _pull_request_number: u64,
+    ) -> Result<PullRequestView, Error> {
+        Err(Error::RunTriageUnavailable)
+    }
+    fn load_job_step_log(
+        &self,
+        _repository: &Repository,
+        _job_id: u64,
+        _step: &WorkflowStep,
+    ) -> Result<String, Error> {
         Err(Error::RunTriageUnavailable)
     }
     fn triage_run(
@@ -348,29 +386,21 @@ impl WorkflowSource for GhWorkflowSource {
             "api", "-X", "GET", &pull_path,
         ])?)?)?;
         let runs_path = repository.pull_request_runs_api_path(&pull.head.sha);
-        let latest_failed_runs = find_latest_failed_pull_request_runs_with(&runs_path, |path| {
+        let latest_runs = find_latest_pull_request_runs_with(&runs_path, |path| {
             successful_stdout(run_gh(&["api", "-X", "GET", path])?)
         })?;
 
         let workflows = self.list_workflows(repository)?;
-        let targets = workflows
-            .iter()
-            .filter_map(|workflow| {
-                latest_failed_runs
-                    .get(&workflow.id)
-                    .copied()
-                    .map(|run_id| (workflow, run_id))
-            })
-            .collect::<Vec<_>>();
+        let targets = pull_request_triage_targets(&workflows, &latest_runs);
         let mut configurations = Vec::new();
         let mut failures = Vec::new();
         for chunk in targets.chunks(MAX_CONCURRENT_REQUESTS) {
             let results = thread::scope(|scope| {
                 let handles = chunk
                     .iter()
-                    .map(|&(workflow, run_id)| {
+                    .map(|&(workflow, run)| {
                         scope.spawn(move || {
-                            build_pull_request_configurations(repository, workflow, run_id)
+                            build_pull_request_configurations(repository, workflow, run)
                         })
                     })
                     .collect::<Vec<_>>();
@@ -388,6 +418,75 @@ impl WorkflowSource for GhWorkflowSource {
             workflows: configurations,
             failures,
         })
+    }
+
+    fn load_pull_request(
+        &self,
+        repository: &Repository,
+        pull_request_number: u64,
+    ) -> Result<PullRequestView, Error> {
+        let pull_path = repository.pull_request_api_path(pull_request_number);
+        let pull: PullRequestResponse = serde_json::from_slice(&successful_stdout(run_gh(&[
+            "api", "-X", "GET", &pull_path,
+        ])?)?)?;
+        let runs_path = repository.pull_request_runs_api_path(&pull.head.sha);
+        let latest_runs = find_latest_pull_request_runs_with(&runs_path, |path| {
+            successful_stdout(run_gh(&["api", "-X", "GET", path])?)
+        })?;
+        let workflows = self.list_workflows(repository)?;
+        let targets = workflows
+            .iter()
+            .filter_map(|workflow| latest_runs.get(&workflow.id).map(|run| (workflow, run)))
+            .collect::<Vec<_>>();
+        let mut view_workflows = Vec::new();
+        let mut view_jobs = BTreeMap::new();
+        for chunk in targets.chunks(MAX_CONCURRENT_REQUESTS) {
+            let results = thread::scope(|scope| {
+                let handles = chunk
+                    .iter()
+                    .map(|&(workflow, run)| {
+                        scope.spawn(move || {
+                            let jobs = fetch_jobs(repository, run.id)?;
+                            let workflows = pull_request_view_workflows(workflow, run, &jobs);
+                            let jobs: Vec<PullRequestJob> = if jobs.len() <= 1 {
+                                jobs.first().into_iter().map(pull_request_job).collect()
+                            } else {
+                                jobs.iter().map(pull_request_job).collect()
+                            };
+                            Ok((workflows, jobs))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().map_err(|_| Error::StatusWorker)?)
+                    .collect::<Result<Vec<_>, Error>>()
+            })?;
+            for (workflows, jobs) in results {
+                for (index, workflow) in workflows.into_iter().enumerate() {
+                    if let Some(job) = jobs.get(index).cloned() {
+                        view_jobs.insert(workflow.id, job);
+                    }
+                    view_workflows.push(workflow);
+                }
+            }
+        }
+        Ok(PullRequestView {
+            workflows: view_workflows,
+            jobs: view_jobs,
+        })
+    }
+
+    fn load_job_step_log(
+        &self,
+        repository: &Repository,
+        job_id: u64,
+        step: &WorkflowStep,
+    ) -> Result<String, Error> {
+        let log = fetch_job_log(repository, job_id)?;
+        Ok(step.started_at.map_or_else(String::new, |_| {
+            extract_step_log(&log, step.started_at, step.completed_at)
+        }))
     }
 
     fn triage_run(
@@ -891,9 +990,9 @@ fn build_jobs_triage(
 fn build_pull_request_configurations(
     repository: &Repository,
     workflow: &Workflow,
-    run_id: u64,
+    run: &LatestWorkflowRun,
 ) -> Result<PullRequestTriage, Error> {
-    let jobs = fetch_jobs(repository, run_id)?;
+    let jobs = fetch_jobs(repository, run.id)?;
     let mut workflows = Vec::new();
     let mut failures = Vec::new();
     for job in jobs.iter().filter(|job| is_failed_job(job)) {
@@ -905,15 +1004,15 @@ fn build_pull_request_configurations(
             true,
         )?;
         let configuration =
-            matrix_configuration_workflow(workflow, job, run_id, triage.failed_steps.clone());
+            matrix_configuration_workflow(workflow, job, run.id, triage.failed_steps.clone());
         workflows.push(configuration);
         failures.push(triage);
     }
-    if workflows.is_empty() {
+    if workflows.is_empty() && run.conclusion.as_deref() == Some("failure") {
         let triage = build_jobs_triage(repository, workflow.id, &jobs, true)?;
         let mut workflow = workflow.clone();
         workflow.run_status = RunStatus::Failure;
-        workflow.last_completed_run_id = Some(run_id);
+        workflow.last_completed_run_id = Some(run.id);
         workflow.failing_steps = Some(triage.failed_steps.clone());
         workflows.push(workflow);
         failures.push(triage);
@@ -1024,10 +1123,17 @@ fn find_failed_scheduled_run_with(
         .and_then(|(id, _)| id))
 }
 
-fn find_latest_failed_pull_request_runs_with(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LatestWorkflowRun {
+    id: u64,
+    status: Option<String>,
+    conclusion: Option<String>,
+}
+
+fn find_latest_pull_request_runs_with(
     runs_path: &str,
     mut fetch_page: impl FnMut(&str) -> Result<Vec<u8>, Error>,
-) -> Result<BTreeMap<u64, u64>, Error> {
+) -> Result<BTreeMap<u64, LatestWorkflowRun>, Error> {
     let mut latest = BTreeMap::new();
     let mut page_number = 1;
     loop {
@@ -1038,11 +1144,13 @@ fn find_latest_failed_pull_request_runs_with(
             let (Some(workflow_id), Some(run_id)) = (run.workflow_id, run.id) else {
                 continue;
             };
-            latest.entry(workflow_id).or_insert_with(|| {
-                (run.status.as_deref() == Some("completed")
-                    && run.conclusion.as_deref() == Some("failure"))
-                .then_some(run_id)
-            });
+            latest
+                .entry(workflow_id)
+                .or_insert_with(|| LatestWorkflowRun {
+                    id: run_id,
+                    status: run.status,
+                    conclusion: run.conclusion,
+                });
         }
         if page_len < RUNS_PER_PAGE {
             break;
@@ -1050,10 +1158,112 @@ fn find_latest_failed_pull_request_runs_with(
         page_number += 1;
     }
 
-    Ok(latest
-        .into_iter()
-        .filter_map(|(workflow_id, run_id)| run_id.map(|run_id| (workflow_id, run_id)))
-        .collect())
+    Ok(latest)
+}
+
+fn pull_request_triage_targets<'a>(
+    workflows: &'a [Workflow],
+    latest_runs: &'a BTreeMap<u64, LatestWorkflowRun>,
+) -> Vec<(&'a Workflow, &'a LatestWorkflowRun)> {
+    workflows
+        .iter()
+        .filter_map(|workflow| latest_runs.get(&workflow.id).map(|run| (workflow, run)))
+        .collect()
+}
+
+fn pull_request_view_workflows(
+    workflow: &Workflow,
+    run: &LatestWorkflowRun,
+    jobs: &[Job],
+) -> Vec<Workflow> {
+    if jobs.len() <= 1 {
+        let mut workflow = workflow.clone();
+        apply_pr_status(
+            &mut workflow,
+            run.id,
+            run.status.as_deref(),
+            run.conclusion.as_deref(),
+            failed_step_names_from_jobs(jobs),
+        );
+        return vec![workflow];
+    }
+
+    jobs.iter()
+        .map(|job| {
+            let mut configuration = workflow.clone();
+            configuration.id = matrix_configuration_id(job.id);
+            configuration.name = format!("{} / {}", workflow.name, job.name);
+            apply_pr_status(
+                &mut configuration,
+                run.id,
+                job.status.as_deref(),
+                job.conclusion.as_deref(),
+                failed_step_names_from_jobs(std::slice::from_ref(job)),
+            );
+            configuration
+        })
+        .collect()
+}
+
+fn pull_request_job(job: &Job) -> PullRequestJob {
+    PullRequestJob {
+        id: job.id,
+        name: job.name.clone(),
+        steps: job
+            .steps
+            .iter()
+            .map(|step| WorkflowStep {
+                name: step.name.clone(),
+                status: if step.conclusion.is_some() {
+                    Some("completed".to_owned())
+                } else if step.started_at.is_some() {
+                    Some("in_progress".to_owned())
+                } else {
+                    Some("queued".to_owned())
+                },
+                conclusion: step.conclusion.clone(),
+                started_at: step.started_at,
+                completed_at: step.completed_at,
+            })
+            .collect(),
+    }
+}
+
+fn apply_pr_status(
+    workflow: &mut Workflow,
+    run_id: u64,
+    status: Option<&str>,
+    conclusion: Option<&str>,
+    failed_steps: Vec<String>,
+) {
+    workflow.run_status = match conclusion {
+        Some("success") => RunStatus::Success,
+        Some("failure") => RunStatus::Failure,
+        _ => RunStatus::Other,
+    };
+    workflow.is_in_progress = status.is_some_and(|status| status != "completed");
+    workflow.last_completed_run_id = (status == Some("completed")).then_some(run_id);
+    workflow.failing_steps = (workflow.run_status == RunStatus::Failure).then(|| {
+        if failed_steps.is_empty() {
+            "(no failed step reported)".to_owned()
+        } else {
+            failed_steps.join(", ")
+        }
+    });
+}
+
+fn failed_step_names_from_jobs(jobs: &[Job]) -> Vec<String> {
+    let mut names = Vec::new();
+    for step in jobs
+        .iter()
+        .flat_map(|job| &job.steps)
+        .filter(|step| step.conclusion.as_deref() == Some("failure"))
+    {
+        if !names.contains(&step.name) {
+            names.push(step.name.clone());
+        }
+    }
+    names
 }
 
 struct FailedJob {
@@ -1353,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_runs_select_latest_failure_per_workflow() {
+    fn pull_request_runs_select_latest_run_per_workflow() {
         let response = serde_json::to_vec(&json!({
             "workflow_runs": [
                 {
@@ -1393,13 +1603,41 @@ mod tests {
         .unwrap();
 
         let runs =
-            find_latest_failed_pull_request_runs_with(
-                "runs?per_page=100",
-                |_| Ok(response.clone()),
-            )
-            .unwrap();
+            find_latest_pull_request_runs_with("runs?per_page=100", |_| Ok(response.clone()))
+                .unwrap();
 
-        assert_eq!(runs, BTreeMap::from([(3, 30)]));
+        assert_eq!(runs.get(&1).map(|run| run.id), Some(10));
+        assert_eq!(runs.get(&2).map(|run| run.id), Some(20));
+        assert_eq!(runs.get(&3).map(|run| run.id), Some(30));
+    }
+
+    #[test]
+    fn pull_request_triage_inspects_cancelled_runs_for_failed_matrix_jobs() {
+        let workflow = Workflow {
+            id: 7,
+            name: "Tests".to_owned(),
+            path: ".github/workflows/tests.yml".to_owned(),
+            state: "active".to_owned(),
+            run_status: RunStatus::Other,
+            is_in_progress: false,
+            run_metrics: RunMetrics::default(),
+            last_completed_run_id: None,
+            failing_steps: None,
+        };
+        let latest_runs = BTreeMap::from([(
+            7,
+            LatestWorkflowRun {
+                id: 55,
+                status: Some("completed".to_owned()),
+                conclusion: Some("cancelled".to_owned()),
+            },
+        )]);
+
+        let workflows = [workflow];
+        let targets = pull_request_triage_targets(&workflows, &latest_runs);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1.id, 55);
     }
 
     #[test]
@@ -1418,12 +1656,14 @@ mod tests {
         let debug = Job {
             id: 101,
             name: "Test (ubuntu, debug)".to_owned(),
+            status: Some("completed".to_owned()),
             conclusion: Some("failure".to_owned()),
             steps: Vec::new(),
         };
         let release = Job {
             id: 102,
             name: "Test (ubuntu, release)".to_owned(),
+            status: Some("completed".to_owned()),
             conclusion: Some("failure".to_owned()),
             steps: Vec::new(),
         };
@@ -1436,6 +1676,61 @@ mod tests {
         assert_eq!(release.name, "Tests / Test (ubuntu, release)");
         assert_eq!(debug.last_completed_run_id, Some(55));
         assert_eq!(debug.failing_steps.as_deref(), Some("Build"));
+    }
+
+    #[test]
+    fn pull_request_view_projects_matrix_job_statuses_without_history() {
+        let workflow = Workflow {
+            id: 7,
+            name: "Tests".to_owned(),
+            path: ".github/workflows/tests.yml".to_owned(),
+            state: "active".to_owned(),
+            run_status: RunStatus::Other,
+            is_in_progress: false,
+            run_metrics: RunMetrics::default(),
+            last_completed_run_id: None,
+            failing_steps: None,
+        };
+        let run = LatestWorkflowRun {
+            id: 55,
+            status: Some("completed".to_owned()),
+            conclusion: Some("failure".to_owned()),
+        };
+        let jobs = vec![
+            Job {
+                id: 101,
+                name: "Debug configuration".to_owned(),
+                status: Some("completed".to_owned()),
+                conclusion: Some("success".to_owned()),
+                steps: Vec::new(),
+            },
+            Job {
+                id: 102,
+                name: "Release configuration".to_owned(),
+                status: Some("completed".to_owned()),
+                conclusion: Some("failure".to_owned()),
+                steps: vec![JobStep {
+                    name: "Run tests".to_owned(),
+                    conclusion: Some("failure".to_owned()),
+                    started_at: None,
+                    completed_at: None,
+                }],
+            },
+        ];
+
+        let configurations = pull_request_view_workflows(&workflow, &run, &jobs);
+
+        assert_eq!(configurations.len(), 2);
+        assert_eq!(configurations[0].name, "Tests / Debug configuration");
+        assert_eq!(configurations[0].run_status, RunStatus::Success);
+        assert_eq!(configurations[1].run_status, RunStatus::Failure);
+        assert_eq!(configurations[1].name, "Tests / Release configuration");
+        assert_eq!(
+            configurations[1].failing_steps.as_deref(),
+            Some("Run tests")
+        );
+        assert_eq!(configurations[0].run_metrics, RunMetrics::default());
+        assert_eq!(configurations[1].run_metrics, RunMetrics::default());
     }
 
     #[test]
@@ -1637,6 +1932,7 @@ mod tests {
             Job {
                 id: 1,
                 name: "Linux".to_owned(),
+                status: Some("completed".to_owned()),
                 conclusion: Some("failure".to_owned()),
                 steps: vec![
                     JobStep {
@@ -1662,6 +1958,7 @@ mod tests {
             Job {
                 id: 2,
                 name: "Windows".to_owned(),
+                status: Some("completed".to_owned()),
                 conclusion: Some("failure".to_owned()),
                 steps: vec![
                     JobStep {

@@ -67,6 +67,8 @@ impl Default for ViewLayout {
 pub struct ViewTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_number: Option<u64>,
     pub workflow_ids: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -191,6 +193,7 @@ impl ViewState {
         if tabs.is_empty() {
             tabs.push(ViewTab {
                 name: None,
+                pull_request_number: None,
                 workflow_ids: workflow_ids.clone(),
                 filter: stored.filter,
                 sort: stored.sort,
@@ -297,6 +300,7 @@ mod tests {
             &workflows,
             vec![ViewTab {
                 name: Some("Failures".to_owned()),
+                pull_request_number: None,
                 workflow_ids: vec![42, 7],
                 filter: Some("status:success".to_owned()),
                 sort: Some("name:desc".to_owned()),

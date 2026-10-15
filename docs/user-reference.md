@@ -109,7 +109,7 @@ to execute a command or Escape to return to Normal mode.
 | `Ctrl-u` or Page Up | Move backward up to 10 workflows |
 | `gg` or Home | Select the first workflow |
 | `G` or End | Select the last workflow |
-| Enter | Open the selected workflow's runs, or triage the selected run |
+| Enter | Open workflow runs, PR job steps, or the selected run/step log |
 | `Ctrl+Tab` | Switch to the next tab |
 | `Ctrl+Shift+Tab` | Switch to the previous tab |
 | `Ctrl-w`, then an arrow or `h`/`j`/`k`/`l` | Focus the split view in that direction |
@@ -231,15 +231,17 @@ Page Down/Page Up for larger steps, and Home/End to jump to either end.
 pull request run for every active workflow in the current repository and
 analyzes the failed runs. Successful, queued, and in-progress latest runs are
 not replaced by older failures. Passing the same pull request URL directly to
-`gh actui` starts this analysis after the repository loads. Pull request triage
+`gh actui` opens a pull request status tab after the repository loads. Pull request triage
 downloads failed job logs and includes the same diagnostics, failed tests, and
 step-log details shown when triaging an individual run.
 
-For matrix workflows, each failed expanded job is displayed as a separate
-configuration named `WORKFLOW / JOB (MATRIX VALUES)`. Diagnostics, failed tests,
-and lit summaries are calculated independently for each configuration. The
-cross-workflow summary treats these configurations as distinct workflows, so a
-test failing in multiple matrix configurations is correlated across them.
+For matrix workflows, each expanded job is displayed as a separate
+configuration named `WORKFLOW / EXPANDED JOB NAME`. This also supports custom
+job names that do not include parenthesized matrix values. Diagnostics, failed
+tests, and lit summaries are calculated independently for each failed
+configuration. The cross-workflow summary treats these configurations as
+distinct workflows, so a test failing in multiple matrix configurations is
+correlated across them.
 
 For each candidate, `gh-actui` first fetches its workflow YAML and excludes
 workflows without a top-level `on.schedule` trigger. This prevents
@@ -283,6 +285,20 @@ tab's workflow subset and replaces its results in place. It does not create
 another tab. Automatic interval refreshes continue to update the shared
 workflow and run data only; they do not repeatedly download triage jobs and
 logs.
+
+### Pull request job details
+
+In a pull request status tab, press Enter on a highlighted job to open its
+steps in a modal. Completed successful steps have a green sphere, failed steps
+have a red sphere, skipped steps have a white sphere, and active steps have a
+yellow sphere. Use `j`/`k`, arrows, Home, and End to select a step. Escape
+closes the modal.
+
+Press Enter on a selected step to close the modal and split the tab into a 20%
+job list and an 80% full step-log view. Use `j`/`k`, paging, Home, and End to
+scroll the log. `/` and `?` start forward and backward regular-expression
+searches, while `n` and `N` move between matches. Escape closes the log split
+and returns to the pull request job list.
 
 ### Workflow details
 
