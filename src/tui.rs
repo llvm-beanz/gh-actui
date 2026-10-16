@@ -324,6 +324,7 @@ struct App {
     should_quit: bool,
     animation_started: Instant,
     refresh_interval: Duration,
+    last_updated: Option<chrono::DateTime<chrono::Utc>>,
     next_refresh: Instant,
     pending_ctrl_w: bool,
     pane_areas: Vec<(usize, Rect)>,
@@ -392,6 +393,7 @@ impl App {
             should_quit: false,
             animation_started: Instant::now(),
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            last_updated: None,
             next_refresh: Instant::now() + DEFAULT_REFRESH_INTERVAL,
             pending_ctrl_w: false,
             pane_areas: Vec::new(),
@@ -686,6 +688,7 @@ impl App {
                         return;
                     }
                 }
+                self.last_updated = Some(chrono::Utc::now());
                 self.message = Some(format!(
                     "{} pull request workflows loaded",
                     workflow_ids.len()
@@ -914,6 +917,8 @@ impl App {
         let mut carried_over = BTreeSet::new();
         if kind == LoadKind::Refresh {
             carried_over = carry_workflow_runtime_fields(&mut workflows, &self.workflows);
+        } else {
+            self.last_updated = None;
         }
         self.repository = repository;
         self.workflows = match workflow_ids {
@@ -981,6 +986,9 @@ impl App {
         let restore_pull_requests = result.is_ok() && pending.kind != LoadKind::Refresh;
         match result {
             Ok(()) => {
+                if self.load_failures.is_empty() {
+                    self.last_updated = Some(chrono::Utc::now());
+                }
                 let completed = match pending.kind {
                     LoadKind::Refresh => format!("{} workflows refreshed", self.workflows.len()),
                     LoadKind::Initial | LoadKind::Edit => {
@@ -1152,6 +1160,13 @@ impl App {
 
     fn refresh_rate_label(&self) -> String {
         format!("refresh: {}s", self.refresh_interval.as_secs())
+    }
+
+    fn last_updated_label(&self) -> String {
+        self.last_updated.map_or_else(
+            || "updated: never".to_owned(),
+            |updated| format!("updated: {}", updated.format("%H:%M:%S UTC")),
+        )
     }
 
     fn normal_status(&self) -> (&'static str, String) {
@@ -2905,7 +2920,14 @@ impl App {
         match self.mode {
             Mode::Normal => {
                 let (title, text) = self.normal_status();
-                render_status_bar(frame, help_area, &text, &self.refresh_rate_label(), title);
+                render_status_bar(
+                    frame,
+                    help_area,
+                    &text,
+                    &self.refresh_rate_label(),
+                    &self.last_updated_label(),
+                    title,
+                );
             }
             mode @ (Mode::Command | Mode::Search(_)) => {
                 let (prefix, title) = match mode {
@@ -2919,6 +2941,7 @@ impl App {
                     help_area,
                     &format!("{prefix}{}", self.command),
                     &self.refresh_rate_label(),
+                    &self.last_updated_label(),
                     title,
                 );
 
@@ -3737,13 +3760,15 @@ fn render_status_bar(
     area: Rect,
     text: &str,
     refresh_rate: &str,
+    last_updated: &str,
     status: &str,
 ) -> Rect {
     let bar_style = Style::default().fg(Color::White).bg(Color::DarkGray);
     frame.render_widget(Block::default().style(bar_style), area);
 
-    let suffix_width = (refresh_rate.chars().count() + status.chars().count() + 2)
-        .min(usize::from(area.width)) as u16;
+    let suffix_width =
+        (refresh_rate.chars().count() + last_updated.chars().count() + status.chars().count() + 4)
+            .min(usize::from(area.width)) as u16;
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(suffix_width)]).areas(area);
 
@@ -3751,6 +3776,7 @@ fn render_status_bar(
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(format!("{refresh_rate}  ")),
+            Span::raw(format!("{last_updated}  ")),
             Span::styled(
                 status.to_owned(),
                 Style::default()
@@ -5424,6 +5450,73 @@ mod tests {
             Some("Refresh rate set to 30 seconds")
         );
         assert_eq!(app.refresh_rate_label(), "refresh: 30s");
+    }
+
+    #[test]
+    fn last_updated_label_formats_utc_and_unavailable_time() {
+        let mut app = app(1);
+        assert_eq!(app.last_updated_label(), "updated: never");
+        app.last_updated = Some("2026-10-16T21:41:29Z".parse().unwrap());
+        assert_eq!(app.last_updated_label(), "updated: 21:41:29 UTC");
+    }
+
+    #[test]
+    fn last_updated_changes_only_after_successful_loading() {
+        let mut app = app(1);
+        let previous = "2020-01-01T00:00:00Z".parse().unwrap();
+        app.last_updated = Some(previous);
+        app.refresh_workflows();
+        assert_eq!(app.last_updated, Some(previous));
+        app.finish_loading(Err("test failure".to_owned()));
+        assert_eq!(app.last_updated, Some(previous));
+
+        app.refresh_workflows();
+        app.load_failures.push("failed workflow".to_owned());
+        app.finish_loading(Ok(()));
+        assert_eq!(app.last_updated, Some(previous));
+
+        app.refresh_workflows();
+        complete_loading(&mut app);
+        assert!(app.last_updated.unwrap() > previous);
+    }
+
+    #[test]
+    fn last_updated_is_set_after_pull_request_status_load() {
+        let mut app = app(1);
+        assert!(app.last_updated.is_none());
+        app.start_pull_request_view(42, PullRequestViewTarget::Replace { index: 0 });
+        let result = app
+            .pull_request_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender.send(result).unwrap();
+        app.pull_request_receiver = Some(receiver);
+        app.poll_pull_request_view();
+        assert!(app.last_updated.is_some());
+    }
+
+    #[test]
+    fn render_footer_places_last_updated_after_refresh_rate_in_all_modes() {
+        let mut app = app(1);
+        app.last_updated = Some("2026-10-16T21:41:29Z".parse().unwrap());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        for mode in [
+            Mode::Normal,
+            Mode::Command,
+            Mode::Search(SearchDirection::Forward),
+            Mode::Search(SearchDirection::Backward),
+        ] {
+            app.mode = mode;
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let footer = (0..120)
+                .map(|column| terminal.backend().buffer()[(column, 23)].symbol())
+                .collect::<String>();
+            assert!(footer.contains("refresh: 60s  updated: 21:41:29 UTC"));
+        }
     }
 
     #[test]

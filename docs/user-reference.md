@@ -63,10 +63,14 @@ default and retain the previous status and metrics until each updated result
 arrives; only workflows that have no data yet, such as ones discovered during
 that refresh, show `loading...` placeholders.
 
-The bottom bar always displays the configured refresh rate. While loading or
+The bottom bar always displays the configured refresh rate, followed by
+`updated: HH:MM:SS UTC`, the time of the last successful workflow load or
+refresh (including pull request status loads). It displays `updated: never`
+until the first successful load. Failed or partially failed refreshes retain
+the previous timestamp. While loading or
 refreshing, it shows the current operation and run-status progress. The
 borderless bar occupies one terminal row. Messages and command input stay
-anchored at the left edge, while the refresh rate and the highlighted current
+anchored at the left edge, while the refresh rate, last-updated time, and highlighted current
 mode or operation stay anchored at the right edge. The interface remains
 responsive during background work.
 
@@ -325,12 +329,9 @@ started display `-`.
 Use the normal `j`/`k`, arrow, paging, and jump bindings to navigate runs.
 Press Enter on a run to split the lower panel vertically. The run table remains
 in the left 20%, while the right 80% displays an Issue pane followed by the
-full failing-step log. The Issue pane and log scroll together as one continuous
-view. Use `j`/`k`, arrows, or the mouse wheel over the right-hand pane to scroll;
-`Ctrl-d`/`Ctrl-u` or Page Down/Page Up move by larger steps, and `gg`/Home or
-`G`/End jump to either end. `/` starts a forward regular-expression search of
-the log and `?` starts a backward search, including while viewing the Issue
-pane. Press Enter to
+full failing-step log. Use `j`/`k`, arrows, paging, and jump bindings to select
+and scroll these panes. When the log pane is selected, `/` starts a forward
+regular-expression search and `?` starts a backward search. Press Enter to
 run the search or Escape to cancel it. Matches are highlighted in the log;
 press `n` for the next occurrence or `N` for the previous occurrence. Searches
 wrap at the end of the log.
