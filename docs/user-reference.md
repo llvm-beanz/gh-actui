@@ -325,9 +325,12 @@ started display `-`.
 Use the normal `j`/`k`, arrow, paging, and jump bindings to navigate runs.
 Press Enter on a run to split the lower panel vertically. The run table remains
 in the left 20%, while the right 80% displays an Issue pane followed by the
-full failing-step log. Use `j`/`k`, arrows, paging, and jump bindings to select
-and scroll these panes. When the log pane is selected, `/` starts a forward
-regular-expression search and `?` starts a backward search. Press Enter to
+full failing-step log. The Issue pane and log scroll together as one continuous
+view. Use `j`/`k`, arrows, or the mouse wheel over the right-hand pane to scroll;
+`Ctrl-d`/`Ctrl-u` or Page Down/Page Up move by larger steps, and `gg`/Home or
+`G`/End jump to either end. `/` starts a forward regular-expression search of
+the log and `?` starts a backward search, including while viewing the Issue
+pane. Press Enter to
 run the search or Escape to cancel it. Matches are highlighted in the log;
 press `n` for the next occurrence or `N` for the previous occurrence. Searches
 wrap at the end of the log.

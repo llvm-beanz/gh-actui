@@ -183,7 +183,6 @@ struct Tab {
     run_table_state: TableState,
     run_triage_run_id: Option<u64>,
     run_triage: Option<WorkflowTriage>,
-    run_triage_block: usize,
     run_triage_scroll: u16,
     run_triage_max_scroll: u16,
     run_triage_log_width: u16,
@@ -216,7 +215,6 @@ impl Tab {
             run_table_state: TableState::default(),
             run_triage_run_id: None,
             run_triage: None,
-            run_triage_block: 0,
             run_triage_scroll: 0,
             run_triage_max_scroll: 0,
             run_triage_log_width: 0,
@@ -250,7 +248,6 @@ impl Tab {
             run_table_state: TableState::default(),
             run_triage_run_id: None,
             run_triage: None,
-            run_triage_block: 0,
             run_triage_scroll: 0,
             run_triage_max_scroll: 0,
             run_triage_log_width: 0,
@@ -1312,7 +1309,6 @@ impl App {
                 let tab = self.active_tab_mut();
                 tab.run_triage_run_id = None;
                 tab.run_triage = None;
-                tab.run_triage_block = 0;
                 tab.run_triage_scroll = 0;
                 tab.run_triage_max_scroll = 0;
                 tab.run_triage_log_width = 0;
@@ -1352,12 +1348,13 @@ impl App {
             .pane_areas
             .iter()
             .any(|(_, area)| area.contains((mouse.column, mouse.row).into()));
+        let scrollable = self.active_tab().is_triage || self.active_tab().run_triage.is_some();
         match mouse.kind {
-            MouseEventKind::ScrollDown if self.active_tab().is_triage && over_active_pane => {
+            MouseEventKind::ScrollDown if scrollable && over_active_pane => {
                 self.select_next(3);
                 return;
             }
-            MouseEventKind::ScrollUp if self.active_tab().is_triage && over_active_pane => {
+            MouseEventKind::ScrollUp if scrollable && over_active_pane => {
                 self.select_previous(3);
                 return;
             }
@@ -1460,8 +1457,7 @@ impl App {
     }
 
     fn run_triage_log_is_active(&self) -> bool {
-        self.active_tab().pull_request_step_log.is_some()
-            || (self.active_tab().run_triage.is_some() && self.active_tab().run_triage_block == 1)
+        self.active_tab().pull_request_step_log.is_some() || self.active_tab().run_triage.is_some()
     }
 
     fn active_log_text(&self) -> Option<&str> {
@@ -1518,7 +1514,10 @@ impl App {
         };
         let tab = self.active_tab();
         let width = tab.run_triage_log_width;
-        let scroll = tab.run_triage_scroll;
+        let log_offset = tab.run_triage.as_ref().map_or(0, |triage| {
+            triage_block_height(&triage_text(Some(triage)), width).saturating_add(1)
+        });
+        let scroll = tab.run_triage_scroll.saturating_sub(log_offset);
         let previous_match = (tab.run_triage_search_pattern.as_deref() == Some(pattern.as_str()))
             .then_some(tab.run_triage_search_match)
             .flatten();
@@ -1557,8 +1556,9 @@ impl App {
             return;
         };
         let tab = self.active_tab_mut();
-        tab.run_triage_block = 1;
-        tab.run_triage_scroll = row.min(tab.run_triage_max_scroll);
+        tab.run_triage_scroll = row
+            .saturating_add(log_offset)
+            .min(tab.run_triage_max_scroll);
         tab.run_triage_search_pattern = Some(pattern.clone());
         tab.run_triage_search_match = Some(matched_at);
         self.message = Some(format!(
@@ -2114,7 +2114,6 @@ impl App {
 
         self.active_tab_mut().run_triage_run_id = Some(run_id);
         self.active_tab_mut().run_triage = None;
-        self.active_tab_mut().run_triage_block = 0;
         self.active_tab_mut().run_triage_scroll = 0;
         self.active_tab_mut().run_triage_max_scroll = 0;
         self.active_tab_mut().run_triage_log_width = 0;
@@ -2230,7 +2229,6 @@ impl App {
         tab.pull_request_step_job_id = Some(job_id);
         tab.pull_request_step_title = Some(title.clone());
         tab.pull_request_step_log = None;
-        tab.run_triage_block = 1;
         tab.run_triage_scroll = 0;
         tab.run_triage_max_scroll = 0;
         tab.run_triage_log_width = 0;
@@ -2543,14 +2541,10 @@ impl App {
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
-                if tab.run_triage_block == 0 {
-                    tab.run_triage_block = 1;
-                } else {
-                    tab.run_triage_scroll = tab
-                        .run_triage_scroll
-                        .saturating_add(amount as u16)
-                        .min(tab.run_triage_max_scroll);
-                }
+                tab.run_triage_scroll = tab
+                    .run_triage_scroll
+                    .saturating_add(amount as u16)
+                    .min(tab.run_triage_max_scroll);
                 return;
             }
             let count = self.active_tab().runs.len();
@@ -2587,11 +2581,7 @@ impl App {
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
-                if tab.run_triage_scroll > 0 {
-                    tab.run_triage_scroll = tab.run_triage_scroll.saturating_sub(amount as u16);
-                } else {
-                    tab.run_triage_block = 0;
-                }
+                tab.run_triage_scroll = tab.run_triage_scroll.saturating_sub(amount as u16);
                 return;
             }
             let current = self.active_tab().run_table_state.selected().unwrap_or(0);
@@ -2622,7 +2612,6 @@ impl App {
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
-                tab.run_triage_block = 0;
                 tab.run_triage_scroll = 0;
                 return;
             }
@@ -2650,7 +2639,6 @@ impl App {
         if self.active_tab().details_workflow_id.is_some() {
             if self.active_tab().run_triage.is_some() {
                 let tab = self.active_tab_mut();
-                tab.run_triage_block = 1;
                 tab.run_triage_scroll = tab.run_triage_max_scroll;
                 return;
             }
@@ -2741,7 +2729,6 @@ impl App {
                 tab.triage_scroll = tab.triage_scroll.min(max_scroll);
             }
         } else if self.active_tab().details_workflow_id.is_some() {
-            self.pane_areas.push((0, table_area));
             let loading = self.run_details_receiver.is_some()
                 && self.run_details_target == Some(self.active_tab);
             let repository = self.repository.clone();
@@ -2764,6 +2751,7 @@ impl App {
             } else {
                 (runs_area, None)
             };
+            self.pane_areas.push((0, triage_area.unwrap_or(table_area)));
             render_workflow_runs(
                 frame,
                 runs_area,
@@ -2795,7 +2783,6 @@ impl App {
                         frame,
                         triage_area,
                         triage,
-                        tab.run_triage_block,
                         tab.run_triage_scroll,
                         tab.run_triage_search_pattern.as_deref(),
                         tab.run_triage_search_match,
@@ -3081,8 +3068,7 @@ fn render_run_triage_blocks(
     frame: &mut Frame,
     area: Rect,
     triage: &WorkflowTriage,
-    selected: usize,
-    log_scroll: u16,
+    scroll: u16,
     search_pattern: Option<&str>,
     search_match: Option<usize>,
 ) -> u16 {
@@ -3095,37 +3081,30 @@ fn render_run_triage_blocks(
         (" Issue ", triage_text(Some(triage))),
         (" Failing step log ", log),
     ];
-    let log_max_scroll = triage_block_height(&blocks[1].1, area.width).saturating_sub(area.height);
-    let mut y = area.y;
-    for (index, (title, text)) in blocks.into_iter().enumerate().skip(selected) {
-        if y >= area.bottom() {
-            break;
-        }
-        let available_height = area.bottom() - y;
-        let height = triage_block_height(&text, area.width)
-            .min(available_height)
-            .max(1);
-        let block_area = Rect::new(area.x, y, area.width, height);
-        let border_style = if index == selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
+    let heights = blocks
+        .each_ref()
+        .map(|(_, text)| triage_block_height(text, area.width));
+    let total_height = heights[0].saturating_add(heights[1]);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, area.width, total_height.max(area.height)));
+    let mut y: u16 = 0;
+    for ((title, text), height) in blocks.into_iter().zip(heights) {
+        let height = height.min(total_height.saturating_sub(y));
+        let block_area = Rect::new(0, y, area.width, height);
         let paragraph = Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .scroll(((index == 1).then_some(log_scroll).unwrap_or(0), 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style)
-                    .title(title),
-            );
-        frame.render_widget(paragraph, block_area);
+            .block(Block::default().borders(Borders::ALL).title(title));
+        paragraph.render(block_area, &mut buffer);
         y = y.saturating_add(height);
     }
-    log_max_scroll
+    let max_scroll = total_height.saturating_sub(area.height);
+    let scroll = scroll.min(max_scroll);
+    for row in 0..area.height {
+        for column in 0..area.width {
+            frame.buffer_mut()[(area.x + column, area.y + row)] =
+                buffer[(column, row.saturating_add(scroll))].clone();
+        }
+    }
+    max_scroll
 }
 
 fn highlighted_log_text<'a>(
@@ -5095,10 +5074,6 @@ mod tests {
             app.active_tab().run_triage.as_ref().unwrap().failed_steps,
             "Run 2 step"
         );
-        assert_eq!(app.active_tab().run_triage_block, 0);
-
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.active_tab().run_triage_block, 1);
         app.active_tab_mut().run_triage_max_scroll = 10;
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.active_tab().run_triage_scroll, 1);
@@ -5109,9 +5084,116 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(app.active_tab().run_triage_scroll, 0);
-        assert_eq!(app.active_tab().run_triage_block, 1);
         app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.active_tab().run_triage_block, 0);
+        assert_eq!(app.active_tab().run_triage_scroll, 0);
+
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.active_tab().run_triage_scroll, 10);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.active_tab().run_triage_scroll, 10);
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.active_tab().run_triage_scroll, 0);
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.active_tab().run_triage_scroll, 10);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.active_tab().run_triage_scroll, 0);
+    }
+
+    #[test]
+    fn workflow_run_mouse_wheel_only_scrolls_over_triage_output() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_triage(&mut app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let area = app.pane_areas[0].1;
+        app.active_tab_mut().run_triage_max_scroll = 20;
+        let selected = app.active_tab().run_table_state.selected();
+        let mut mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse);
+        assert_eq!(app.active_tab().run_triage_scroll, 3);
+        mouse.column = area.x - 1;
+        app.handle_mouse(mouse);
+        assert_eq!(app.active_tab().run_triage_scroll, 3);
+        mouse.column = area.x;
+        mouse.kind = MouseEventKind::ScrollUp;
+        app.handle_mouse(mouse);
+        assert_eq!(app.active_tab().run_triage_scroll, 0);
+        assert_eq!(app.active_tab().run_table_state.selected(), selected);
+    }
+
+    #[test]
+    fn render_run_triage_blocks_scrolls_issue_and_log_as_one_view() {
+        let mut app = app(1);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_details(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        complete_run_triage(&mut app);
+        let triage = app.active_tab_mut().run_triage.as_mut().unwrap();
+        triage.lit_summary = (0..20).map(|i| format!("summary {i}\n")).collect();
+        triage.failed_step_log = (0..20).map(|i| format!("log {i}\n")).collect();
+        let width = 40;
+        let issue_height = triage_block_height(&triage_text(Some(triage)), width);
+        let total_height =
+            issue_height + triage_block_height(&Text::from(triage.failed_step_log.as_str()), width);
+        let mut full =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, total_height))
+                .unwrap();
+        full.draw(|frame| {
+            assert_eq!(
+                render_run_triage_blocks(frame, frame.area(), triage, 0, None, None),
+                0
+            );
+        })
+        .unwrap();
+        let area = Rect::new(2, 3, width, 8);
+        let mut viewport =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width + 4, 14)).unwrap();
+        let max_scroll = total_height - area.height;
+        for requested in [
+            0,
+            1,
+            issue_height - 3,
+            issue_height + 2,
+            max_scroll,
+            u16::MAX,
+        ] {
+            viewport
+                .draw(|frame| {
+                    assert_eq!(
+                        render_run_triage_blocks(frame, area, triage, requested, None, None),
+                        max_scroll
+                    );
+                })
+                .unwrap();
+            let scroll = requested.min(max_scroll);
+            for row in 0..area.height {
+                for column in 0..area.width {
+                    assert_eq!(
+                        viewport.backend().buffer()[(area.x + column, area.y + row)],
+                        full.backend().buffer()[(column, scroll + row)],
+                        "scroll {requested}, row {row}, column {column}"
+                    );
+                }
+            }
+        }
+        let rendered = full.backend().buffer();
+        let row_text = |row| {
+            (0..width)
+                .map(|column| rendered[(column, row)].symbol())
+                .collect::<String>()
+        };
+        assert!(row_text(issue_height - 2).contains("summary 19"));
+        assert!(row_text(issue_height + 1).contains("log 0"));
+        assert!(row_text(total_height - 2).contains("log 19"));
     }
 
     #[test]
@@ -5148,24 +5230,25 @@ mod tests {
             .as_mut()
             .unwrap()
             .failed_step_log = "header\nerror ONE\nmiddle\nerror TWO\ntail".to_owned();
-        app.active_tab_mut().run_triage_block = 1;
         app.active_tab_mut().run_triage_log_width = 80;
-        app.active_tab_mut().run_triage_max_scroll = 4;
+        let offset =
+            triage_block_height(&triage_text(app.active_tab().run_triage.as_ref()), 80) + 1;
+        app.active_tab_mut().run_triage_max_scroll = offset + 4;
 
         enter_search(&mut app, '/', r"error [A-Z]+");
-        assert_eq!(app.active_tab().run_triage_scroll, 1);
+        assert_eq!(app.active_tab().run_triage_scroll, offset + 1);
         assert_eq!(app.active_tab().run_triage_search_match, Some(7));
 
         enter_search(&mut app, '/', r"error [A-Z]+");
-        assert_eq!(app.active_tab().run_triage_scroll, 3);
+        assert_eq!(app.active_tab().run_triage_scroll, offset + 3);
 
         enter_search(&mut app, '?', r"error [A-Z]+");
-        assert_eq!(app.active_tab().run_triage_scroll, 1);
+        assert_eq!(app.active_tab().run_triage_scroll, offset + 1);
 
         app.handle_key(key(KeyCode::Char('n')));
-        assert_eq!(app.active_tab().run_triage_scroll, 3);
+        assert_eq!(app.active_tab().run_triage_scroll, offset + 3);
         app.handle_key(key(KeyCode::Char('N')));
-        assert_eq!(app.active_tab().run_triage_scroll, 1);
+        assert_eq!(app.active_tab().run_triage_scroll, offset + 1);
     }
 
     #[test]
@@ -5175,7 +5258,6 @@ mod tests {
         complete_run_details(&mut app);
         app.handle_key(key(KeyCode::Enter));
         complete_run_triage(&mut app);
-        app.active_tab_mut().run_triage_block = 1;
         app.active_tab_mut().run_triage_scroll = 3;
 
         enter_search(&mut app, '/', "[");
